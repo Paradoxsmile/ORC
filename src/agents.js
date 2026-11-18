@@ -412,6 +412,12 @@ function consumeAntigravityEvent(event, state, onEvent) {
     if (payload.status && payload.status !== "SUCCESS") {
       state.lastError = payload.error || `Antigravity status: ${payload.status}`;
       onEvent({ kind: "stderr", text: state.lastError });
+    } else if (Array.isArray(payload.denied_actions) && payload.denied_actions.length && !text) {
+      const denied = payload.denied_actions
+        .map((item) => item.display_name || item.action || "tool")
+        .join(", ");
+      state.lastError = `Antigravity denied headless permission (${denied}). Add permissions.allow rules in ~/.gemini/antigravity-cli/settings.json or set ORC_AGY_YOLO=1.`;
+      onEvent({ kind: "stderr", text: state.lastError });
     }
     return;
   }

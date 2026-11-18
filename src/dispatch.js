@@ -509,16 +509,24 @@ async function implementStep(task, project, controller) {
   const implementer = task.agent === "agy" ? "agy" : "claude";
   const runId = startRun(task.id, implementer, label);
 
+  const promptFile = fixing
+    ? `prompt-fix-${Number(task.review_loops ?? 0) || 1}.md`
+    : "prompt-implement.md";
   addEvent({
     taskId: task.id,
     runId,
     actor: implementer,
     type: "agent.prompt",
     text: fixing ? "Fixing review findings" : "Implementing the spec",
-    data: { prompt: path.join(artifactsDir, "prompt-implement.md") },
+    data: { prompt: path.join(artifactsDir, promptFile) },
   });
-  writeFileSync(path.join(artifactsDir, "prompt-implement.md"), prompt, "utf8");
-  const cliPrompt = `Read and follow .orc/${task.id}/prompt-implement.md in this worktree.`;
+  writeFileSync(path.join(artifactsDir, promptFile), prompt, "utf8");
+  if (promptFile !== "prompt-implement.md") {
+    writeFileSync(path.join(artifactsDir, "prompt-implement.md"), prompt, "utf8");
+  }
+  const cliPrompt = fixing
+    ? `The reviewer requested changes (or tests failed). Read .orc/${task.id}/${promptFile} and .orc/${task.id}/review.md, then apply the requested fixes in this worktree.`
+    : `Read and follow .orc/${task.id}/prompt-implement.md in this worktree.`;
 
   const before = (await git(worktree, ["rev-parse", "HEAD"], { allowFailure: true })).stdout.trim();
   const coalescer = createEventCoalescer(task.id, runId, implementer);

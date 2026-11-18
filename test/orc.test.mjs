@@ -322,6 +322,24 @@ describe("stream-json parsers", () => {
     );
     assert.equal(state.lastError, "Unknown model slug");
     assert.equal(events.at(-1).kind, "stderr");
+
+    const deniedState = createStreamState();
+    const deniedEvents = [];
+    consumeLine(
+      "agy",
+      JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "",
+          denied_actions: [{ action: "command", display_name: "Bash" }],
+        },
+      }),
+      deniedState,
+      (event) => deniedEvents.push(event),
+    );
+    assert.match(deniedState.lastError, /denied headless permission \(Bash\)/);
+    assert.equal(deniedEvents.at(-1).kind, "stderr");
   });
 });
 
