@@ -27,10 +27,12 @@ const REQUIRED = [
   "templates/adr.md",
   "README.md",
   "scripts/smoke.mjs",
+  "scripts/probe.mjs",
   "test/orc.test.mjs",
   "test/fixtures/claude-stream.jsonl",
   "test/fixtures/agy-stream.jsonl",
   "docs/decisions/ADR-0001-orchestrate-official-clis.md",
+  "docs/decisions/ADR-0002-worktree-merge-and-concurrency.md",
 ];
 
 function walk(dir, output = []) {

@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { agentLabel, detectAgents, killTree, runAgent } from "./agents.js";
@@ -9,9 +9,10 @@ import {
   failTask,
   getTask,
   setState,
+  syncBoard,
   updateTask,
 } from "./board.js";
-import { ensureProjectGitignore, resolveProject } from "./config.js";
+import { ensureProjectGitignore, listProjects, loadConfig, resolveProject } from "./config.js";
 import { db } from "./db.js";
 import { ensureDir, nowIso, readText, truncate } from "./util.js";
 
@@ -44,6 +45,238 @@ export function stopTask(taskId) {
 
 export { MAX_PIPELINE_STEPS };
 
+export function maxConcurrency() {
+  const envVal = Number(process.env.ORC_MAX_CONCURRENCY);
+  if (Number.isFinite(envVal) && envVal >= 1) return Math.floor(envVal);
+  const cfgVal = Number(loadConfig().maxConcurrency);
+  if (Number.isFinite(cfgVal) && cfgVal >= 1) return Math.floor(cfgVal);
+  return 2;
+}
+
+export function activeTaskForProject(projectId, excludeTaskId = null, active = running) {
+  for (const entry of active.values()) {
+    if (entry.projectId === projectId && entry.taskId !== excludeTaskId) {
+      return entry.taskId;
+    }
+  }
+  return null;
+}
+
+/**
+ * Enforces the per-project single-run lock and global concurrency limit.
+ */
+export function checkConcurrency(task, project, active = running) {
+  if (active.has(task.id)) {
+    const error = new Error(`${task.id} is already running`);
+    error.status = 409;
+    throw error;
+  }
+
+  const activeOnProject = activeTaskForProject(project.id, task.id, active);
+  if (activeOnProject) {
+    const message = `Refused: project "${project.name}" already has an active run (${activeOnProject})`;
+    addEvent({
+      taskId: task.id,
+      actor: "orc",
+      type: "run.refused",
+      text: message,
+      data: { reason: "project_locked", activeTaskId: activeOnProject, projectId: project.id },
+    });
+    bus.emit("refresh");
+    const error = new Error(message);
+    error.status = 409;
+    throw error;
+  }
+
+  const limit = maxConcurrency();
+  if (active.size >= limit) {
+    const runningIds = [...active.keys()];
+    const message = `Refused: global concurrency limit (${limit}) reached (${runningIds.join(", ")})`;
+    addEvent({
+      taskId: task.id,
+      actor: "orc",
+      type: "run.refused",
+      text: message,
+      data: { reason: "max_concurrency", limit, running: runningIds },
+    });
+    bus.emit("refresh");
+    const error = new Error(message);
+    error.status = 409;
+    throw error;
+  }
+}
+
+/**
+ * Scans registered projects for existing `.worktrees/<taskId>` directories and
+ * reattaches missing paths, flags stale in-flight tasks, or reports orphans.
+ */
+export function recoverWorktrees() {
+  const relinked = [];
+  const staleTasks = [];
+  const orphaned = [];
+
+  for (const project of listProjects()) {
+    const worktreesRoot = path.join(project.path, ".worktrees");
+    if (!existsSync(worktreesRoot)) continue;
+
+    for (const entry of readdirSync(worktreesRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const fullPath = path.join(worktreesRoot, entry.name);
+      const task = getTask(entry.name);
+
+      if (task) {
+        if (task.worktree !== fullPath) {
+          updateTask(task.id, { worktree: fullPath });
+          relinked.push({ taskId: task.id, worktree: fullPath });
+          addEvent({
+            taskId: task.id,
+            actor: "orc",
+            type: "worktree.recovered",
+            text: `Reattached worktree ${fullPath}`,
+          });
+        }
+        if (!running.has(task.id) && ["working", "review", "verify"].includes(task.state)) {
+          staleTasks.push({ taskId: task.id, state: task.state, worktree: fullPath });
+          addEvent({
+            taskId: task.id,
+            actor: "orc",
+            type: "worktree.stale",
+            text: `Stale in-flight worktree detected in state "${task.state}" at ${fullPath}`,
+          });
+        }
+      } else {
+        orphaned.push({ projectId: project.id, worktree: fullPath });
+      }
+    }
+  }
+
+  if (relinked.length || staleTasks.length) bus.emit("refresh");
+  return { relinked, staleTasks, orphaned };
+}
+
+/**
+ * Rebases a task branch onto baseBranch, fast-forwards baseBranch, archives
+ * `.orc/<taskId>/` artifacts, cleans up the worktree and branch, and marks done.
+ */
+export async function mergeTask(taskId, { actor = "you" } = {}) {
+  const task = getTask(taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  if (running.has(taskId)) throw new Error(`${taskId} is currently running; stop it before merging.`);
+
+  const project = resolveProject(task.project_id);
+  if (!project) throw new Error(`Project "${task.project_id}" is not registered`);
+
+  const activeOnProject = activeTaskForProject(project.id, taskId);
+  if (activeOnProject) {
+    throw new Error(`Project "${project.name}" has an active run (${activeOnProject}); wait or stop it before merging.`);
+  }
+
+  const base = project.baseBranch || "main";
+  const branch = task.branch || `task/${task.id}-${task.slug}`;
+  const worktree = task.worktree || path.join(project.path, ".worktrees", task.id);
+
+  const refuseMerge = (message) => {
+    addEvent({ taskId: task.id, actor: "orc", type: "merge.refused", text: message });
+    bus.emit("refresh");
+    const error = new Error(message);
+    error.status = 409;
+    throw error;
+  };
+
+  const branchCheck = await git(project.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
+    allowFailure: true,
+  });
+  if (!branchCheck.ok) {
+    throw new Error(`Task branch "${branch}" does not exist in ${project.name}.`);
+  }
+
+  const currentBranch = (
+    await git(project.path, ["symbolic-ref", "--short", "HEAD"], { allowFailure: true })
+  ).stdout.trim();
+  if (currentBranch !== base) {
+    refuseMerge(`Main worktree is on branch "${currentBranch || "(detached)"}", expected "${base}".`);
+  }
+
+  const mainStatus = await git(project.path, ["status", "--porcelain", "--untracked-files=no"]);
+  const dirtyMain = mainStatus.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => {
+      if (!line) return false;
+      const file = line.replace(/^[MADRCU?!]+\s+/, "");
+      return file !== "docs/board.md";
+    });
+  if (dirtyMain.length) {
+    refuseMerge(`Main worktree has uncommitted changes (${dirtyMain.join(", ")}). Commit or stash them before merging.`);
+  }
+
+  if (existsSync(worktree)) {
+    const wtStatus = await git(worktree, ["status", "--porcelain", "--untracked-files=no"]);
+    const dirtyWt = wtStatus.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (dirtyWt.length) {
+      refuseMerge(`Task worktree has uncommitted changes (${dirtyWt.join(", ")}). Commit or discard them before merging.`);
+    }
+
+    const wtOrcRoot = path.join(worktree, ".orc");
+    const wtArtifacts = path.join(wtOrcRoot, task.id);
+    const projectArtifacts = path.join(project.path, ".orc", task.id);
+    let archived = false;
+
+    if (existsSync(wtArtifacts)) {
+      ensureDir(path.dirname(projectArtifacts));
+      cpSync(wtArtifacts, projectArtifacts, { recursive: true, force: true });
+      archived = true;
+    }
+    if (existsSync(wtOrcRoot)) {
+      rmSync(wtOrcRoot, { recursive: true, force: true });
+    }
+
+    const rebase = await git(worktree, ["rebase", base], { allowFailure: true });
+    if (!rebase.ok) {
+      await git(worktree, ["rebase", "--abort"], { allowFailure: true });
+      if (archived && existsSync(projectArtifacts)) {
+        ensureDir(wtOrcRoot);
+        cpSync(projectArtifacts, wtArtifacts, { recursive: true, force: true });
+      }
+      refuseMerge(`Rebase of ${branch} onto ${base} failed with conflicts. Resolve manually in ${worktree}.`);
+    }
+  }
+
+  const ff = await git(project.path, ["merge", "--ff-only", branch], { allowFailure: true });
+  if (!ff.ok) {
+    refuseMerge(`Fast-forward merge of ${branch} into ${base} failed: ${ff.stderr}`);
+  }
+  const head = (await git(project.path, ["rev-parse", "HEAD"])).stdout.trim();
+
+  if (existsSync(worktree)) {
+    await git(project.path, ["worktree", "remove", "--force", worktree], { allowFailure: true });
+    if (existsSync(worktree)) rmSync(worktree, { recursive: true, force: true });
+    await git(project.path, ["worktree", "prune"], { allowFailure: true });
+  }
+  await git(project.path, ["branch", "-d", branch]);
+
+  updateTask(task.id, { worktree: null, last_error: null });
+  addEvent({
+    taskId: task.id,
+    actor,
+    type: "task.merged",
+    text: `Merged ${branch} into ${base} (${head.slice(0, 7)}) and removed worktree`,
+    data: { branch, base, head },
+  });
+
+  if (task.state !== "done") {
+    setState(task.id, "done", { note: `Merged into ${base}`, actor });
+  } else {
+    syncBoard(project.id);
+    bus.emit("refresh");
+  }
+
+  return getTask(task.id);
+}
+
 /**
  * Drives one task until it reaches `done`, `blocked`, or a safety limit.
  * Every externally visible step is written to the events table so the UI can
@@ -67,8 +300,9 @@ export async function runTask(taskId, { actor = "you" } = {}) {
 
   const project = resolveProject(task.project_id);
   if (!project) throw new Error(`Project "${task.project_id}" is not registered`);
+  checkConcurrency(task, project);
 
-  const controller = { taskId, child: null, cancelled: false };
+  const controller = { taskId, projectId: project.id, child: null, cancelled: false };
   running.set(taskId, controller);
   addEvent({
     taskId,

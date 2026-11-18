@@ -6,6 +6,7 @@ import {
   initProject,
   loadConfig,
   PUBLIC_DIR,
+  resolveProject,
 } from "./config.js";
 import {
   addEvent,
@@ -19,7 +20,14 @@ import {
   setState,
   syncAll,
 } from "./board.js";
-import { runningTaskIds, runTask, stopTask } from "./dispatch.js";
+import {
+  checkConcurrency,
+  mergeTask,
+  recoverWorktrees,
+  runningTaskIds,
+  runTask,
+  stopTask,
+} from "./dispatch.js";
 import { openTarget, revealFile } from "./open.js";
 import { nowIso, truncate } from "./util.js";
 
@@ -86,6 +94,7 @@ function requireTask(id) {
 }
 
 export function startServer({ port = loadConfig().port } = {}) {
+  recoverWorktrees();
   const clients = new Set();
 
   const server = http.createServer(async (req, res) => {
@@ -213,6 +222,10 @@ async function route(req, res, clients) {
       }
       if (task.state === "done") throw httpError(`${task.id} is already done`, 400);
 
+      const project = resolveProject(task.project_id);
+      if (!project) throw httpError(`Unknown project: ${task.project_id}`, 400);
+      checkConcurrency(task, project);
+
       runTask(task.id, { actor: "you" }).catch((error) => {
         addEvent({
           taskId: task.id,
@@ -229,6 +242,13 @@ async function route(req, res, clients) {
     if (action === "stop" && method === "POST") {
       stopTask(taskId);
       sendJson(res, { ok: true, taskId });
+      return;
+    }
+
+    if (action === "merge" && method === "POST") {
+      await mergeTask(taskId, { actor: "you" });
+      const detail = getTaskDetail(taskId);
+      sendJson(res, { ok: true, ...detail, running: false });
       return;
     }
 

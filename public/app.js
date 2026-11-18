@@ -429,6 +429,7 @@ function renderDrawer() {
 
       <div class="drawer-bar">
         ${actions}
+        ${task.worktree ? `<button class="btn small" data-action="merge" ${running ? "disabled" : ""}>Merge</button>` : ""}
         <button class="btn small" data-action="open-worktree">Open folder</button>
         <button class="btn small" data-action="open-spec">Spec file</button>
         <button class="btn small" data-action="mark-done" ${running ? "disabled" : ""}>Mark done</button>
@@ -613,7 +614,7 @@ async function handleAction(action, element) {
       return;
     }
 
-    if (!id && ["run", "stop", "mark-done", "mark-blocked", "save-spec", "open-worktree", "open-spec"].includes(action)) {
+    if (!id && ["run", "stop", "merge", "mark-done", "mark-blocked", "save-spec", "open-worktree", "open-spec"].includes(action)) {
       return;
     }
 
@@ -632,6 +633,15 @@ async function handleAction(action, element) {
       toast(`${id}: stopping…`);
       scheduleStateRefresh(300);
       scheduleDetailRefresh(350);
+      return;
+    }
+
+    if (action === "merge") {
+      const detail = await api(`/api/tasks/${encodeURIComponent(id)}/merge`, { method: "POST" });
+      ui.detail = detail;
+      renderDrawer();
+      await refreshState();
+      toast(`${id}: merged and cleaned up`, "ok");
       return;
     }
 
@@ -923,6 +933,9 @@ function connectEvents() {
         "verify.failed",
         "diff.captured",
         "task.created",
+        "task.merged",
+        "merge.refused",
+        "run.refused",
       ].includes(event.type)
     ) {
       scheduleStateRefresh(350);

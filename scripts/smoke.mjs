@@ -119,7 +119,7 @@ async function main() {
 
   const { addProject, initProject } = await import("../src/config.js");
   const { createTask, getTaskDetail } = await import("../src/board.js");
-  const { runTask } = await import("../src/dispatch.js");
+  const { mergeTask, runTask } = await import("../src/dispatch.js");
   const { startServer } = await import("../src/server.js");
   const { db } = await import("../src/db.js");
 
@@ -199,6 +199,58 @@ async function main() {
     if (finalState.tasks[0].state !== "done") throw new Error("API state is not done");
     if (finalState.running.length !== 0) throw new Error("running list is not empty");
     log("artifacts, branch, worktree, review, tests, API: ok");
+
+    writeFileSync(path.join(repoDir, "README.md"), "# smoke repo\ndirty\n", "utf8");
+    let refused = false;
+    try {
+      await mergeTask(task.id);
+    } catch (error) {
+      refused = /Main worktree has uncommitted changes/.test(error.message);
+    } finally {
+      git(repoDir, ["checkout", "--", "README.md"]);
+    }
+    if (!refused) throw new Error("expected mergeTask to refuse on dirty main worktree");
+    log("dirty main worktree merge refusal: ok");
+
+    const mergeResponse = await fetch(`http://127.0.0.1:${port}/api/tasks/${task.id}/merge`, {
+      method: "POST",
+    });
+    const mergeData = await mergeResponse.json();
+    if (!mergeResponse.ok || !mergeData.ok) {
+      throw new Error(`merge endpoint failed: ${mergeResponse.status} ${mergeData.error ?? ""}`);
+    }
+    if (!existsSync(path.join(repoDir, "src", "feature.txt"))) {
+      throw new Error("merged feature file missing on main");
+    }
+    if (existsSync(path.join(repoDir, ".worktrees", task.id))) {
+      throw new Error("task worktree still exists after merge");
+    }
+    if (git(repoDir, ["branch", "--list", task.branch])) {
+      throw new Error("task branch still exists after merge");
+    }
+    const mergedDetail = getTaskDetail(task.id);
+    if (
+      !mergedDetail.artifacts.diffExists ||
+      !mergedDetail.artifacts.reviewExists ||
+      !mergedDetail.artifacts.testExists
+    ) {
+      throw new Error("archived artifacts missing after merge");
+    }
+    log("merge, cleanup, archived artifacts: ok");
+
+    const probeDir = path.join(temp, "probes");
+    execFileSync(process.execPath, [path.join(ROOT, "scripts", "probe.mjs"), "--out", probeDir], {
+      env: process.env,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    if (
+      !existsSync(path.join(probeDir, "claude-probe.report.json")) ||
+      !existsSync(path.join(probeDir, "agy-probe.report.json"))
+    ) {
+      throw new Error("probe reports missing");
+    }
+    log("probe script: ok");
 
     console.log("\nSMOKE PASS");
     console.log(`  task: ${task.id}`);

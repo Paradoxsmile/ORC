@@ -119,6 +119,7 @@ node bin/orc.js add <project> "<title>" [--desc "..."] [--accept "- ..."] [--age
 node bin/orc.js list [project]
 node bin/orc.js run <taskId>
 node bin/orc.js stop <taskId>
+node bin/orc.js merge <taskId>
 node bin/orc.js state <taskId> <state>
 node bin/orc.js done <taskId> [--note "..."]
 node bin/orc.js block <taskId> [--note "..."]
@@ -126,6 +127,7 @@ node bin/orc.js status
 node bin/orc.js open [task|project] [--spec] [--project]
 node scripts/check.mjs
 node --test
+node scripts/probe.mjs [--agent claude|agy|all]
 node scripts/smoke.mjs
 ```
 
@@ -158,7 +160,12 @@ verify ──tests fail──> fixing (bounded)
 any failure / too many loops ──> blocked
 ```
 
-- **One task, one worktree, one agent at a time.** Different tasks can run in parallel.
+- **One task, one worktree, one active run per project.** Tasks across different
+  projects can run in parallel up to `ORC_MAX_CONCURRENCY` (default `2`). A second
+  concurrent run on the same project or above the global limit is refused with a
+  `run.refused` event.
+- At server startup and during `orc doctor`, ORC scans `.worktrees/` to reattach unlinked
+  worktrees, flag stale in-flight tasks (`worktree.stale`), and report orphaned directories.
 - Claude implements by default; Antigravity reviews. Choose `--agent agy` to swap the
   implementer (then Claude reviews).
 - Review requires the exact final line `VERDICT: APPROVE` or
@@ -168,7 +175,11 @@ any failure / too many loops ──> blocked
   identity, captures `git diff <base>...HEAD`, and saves it as `diff.patch`.
 - If the project has a `testCommand`, it runs in the worktree before `done`.
 - Stopping kills the process tree and leaves the task blocked with an event trail.
-- Merging the branch back is deliberately manual. ORC does not push or merge.
+- Merging is explicit via `node bin/orc.js merge <taskId>` (or the **Merge** button in
+  the drawer). It refuses if the main worktree is dirty or rebase hits conflicts,
+  archives `.orc/<taskId>/` artifacts into `<project>/.orc/<taskId>/`, fast-forwards
+  `baseBranch`, removes the worktree and task branch, and marks `done`. ORC never pushes
+  or creates PRs.
 
 Artifacts:
 
@@ -259,7 +270,9 @@ work, and use Hydrogen or Sonnet for mechanical UI edits.
 - `STATUS.md` — generated root summary (gitignored).
 - `<project>/docs/board.md` — generated project board.
 
-For tests or a second instance, override `ORC_CONFIG` and `ORC_DATA_DIR`.
+For tests or a second instance, override `ORC_CONFIG` and `ORC_DATA_DIR`. Set
+`ORC_MAX_CONCURRENCY` (or `maxConcurrency` in `orc.config.json`, default `2`) to cap total
+parallel agent runs across projects.
 
 The server binds `127.0.0.1` only. There is no authentication. Do not expose the port.
 
@@ -272,8 +285,9 @@ The server binds `127.0.0.1` only. There is no authentication. Do not expose the
 | GET | `/api/state` | projects, tasks, health, running ids |
 | GET | `/api/tasks/:id` | spec, review, diff, test log, events, runs |
 | POST | `/api/tasks` | create task |
-| POST | `/api/tasks/:id/run` | start pipeline (202) |
+| POST | `/api/tasks/:id/run` | start pipeline (202, or 409 if locked/at limit) |
 | POST | `/api/tasks/:id/stop` | kill active process |
+| POST | `/api/tasks/:id/merge` | rebase, archive artifacts, remove worktree/branch, mark done |
 | POST | `/api/tasks/:id/state` | manual state move |
 | POST | `/api/tasks/:id/block` | mark blocked with note |
 | POST | `/api/tasks/:id/spec` | save spec (Inbox → Ready) |
@@ -300,6 +314,8 @@ src/open.js         Explorer/file reveal
 public/             dashboard (vanilla JS, no build)
 templates/          files copied into managed projects
 scripts/check.mjs   syntax + required-file check
+scripts/probe.mjs   real-CLI headless probe (`claude` / `agy`)
+scripts/smoke.mjs   end-to-end fake-CLI + git + HTTP smoke test
 test/               unit tests (`node --test`) and stream fixtures
 docs/decisions/     ADRs for ORC itself
 ```
@@ -310,15 +326,18 @@ docs/decisions/     ADRs for ORC itself
 
 ```powershell
 node scripts/check.mjs   # syntax + required files
-node --test              # offline unit tests (verdict, states, git, stream parsers)
-node scripts/smoke.mjs   # fake CLIs, real git, real HTTP/SSE plumbing
+node --test              # offline unit tests (verdict, states, git, merge, concurrency, parsers)
+node scripts/probe.mjs   # probe real claude/agy CLIs and capture raw JSONL
+node scripts/smoke.mjs   # fake CLIs, real git, real HTTP/SSE plumbing, merge cleanup
 ```
 
 The unit suite (`node --test`) runs offline with no network and no vendor CLIs, using
-temporary `ORC_CONFIG` and `ORC_DATA_DIR` paths. The smoke test creates a temporary git
-repo and fake `claude`/`agy` binaries on `PATH`. It runs a full task through implementation,
-diff capture, review, tests, and `done`, then checks the branch, worktree, artifacts, and
-API. On success it prints a temp path that is safe to delete.
+temporary `ORC_CONFIG` and `ORC_DATA_DIR` paths. `scripts/probe.mjs` skips any missing
+CLI and saves raw JSONL and report files to `data/probes/` when a CLI is installed. The
+smoke test creates a temporary git repo and fake `claude`/`agy` binaries on `PATH`, runs a
+full task through implementation, diff capture, review, tests, `done`, and `merge`, then
+checks the branch, worktree, archived artifacts, probe output, and API. On success it
+prints a temp path that is safe to delete.
 
 ## 11. Auth and terms
 - Install Claude Code, run `claude` once, complete login. ORC reuses the cached login.
@@ -342,9 +361,8 @@ API. On success it prints a temp path that is safe to delete.
   `agy` is installed on this machine. Unit tests and the fake-CLI smoke test pass.
 - Antigravity `stream-json` parsing covers `init` / `step_update` / `result` envelopes,
   but has not been exercised against a real `agy`.
-- No merge, push, or pull-request automation. Branches stay for manual review.
+- No remote push or pull-request automation (`orc merge` is local rebase + fast-forward only).
 - No authentication; localhost only.
-- One process per task, but no global concurrency limit.
 - The dashboard shows raw markdown; it does not render it.
 - Review verdicts are parsed from text; a missing verdict blocks the task.
 - Windows-first process killing (`taskkill /T /F`); POSIX uses process groups.
@@ -354,8 +372,7 @@ API. On success it prints a temp path that is safe to delete.
 
 ## 13. Next steps
 
-1. Install `claude` and `agy`, authenticate, run `node bin/orc.js doctor`.
-2. Run one throwaway task in a scratch git repo and verify the real stream formats and scoped `agy` permissions.
-3. Add a merge command (`orc merge`) that rebases the task branch and removes the worktree.
-4. Add a global concurrency limit, per-project lock, and stale worktree recovery.
-5. Add model selection to the UI (per project and per role).
+1. Install `claude` and `agy`, authenticate, and run `node bin/orc.js doctor`.
+2. Run `node scripts/probe.mjs` and inspect `data/probes/` to verify real `--help` flags, stream JSONL shapes, and scoped `agy` permissions.
+3. Run one throwaway task in a scratch git repo end-to-end (`run` → `done` → `merge`).
+4. Add model selection to the UI (per project and per role).

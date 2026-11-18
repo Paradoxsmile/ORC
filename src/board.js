@@ -207,7 +207,14 @@ export function getTaskDetail(id) {
   const project = resolveProject(task.project_id);
   const spec = task.spec_path ? readText(task.spec_path) : "";
 
-  const artifactsDir = task.worktree ? path.join(task.worktree, ".orc", task.id) : null;
+  const worktreeArtifacts = task.worktree ? path.join(task.worktree, ".orc", task.id) : null;
+  const projectArtifacts = project ? path.join(project.path, ".orc", task.id) : null;
+  const artifactsDir =
+    worktreeArtifacts && existsSync(worktreeArtifacts)
+      ? worktreeArtifacts
+      : projectArtifacts && existsSync(projectArtifacts)
+        ? projectArtifacts
+        : worktreeArtifacts || projectArtifacts;
   const reviewPath = artifactsDir ? path.join(artifactsDir, "review.md") : null;
   const diffPath = artifactsDir ? path.join(artifactsDir, "diff.patch") : null;
   const testPath = artifactsDir ? path.join(artifactsDir, "test.log") : null;

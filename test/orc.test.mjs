@@ -25,10 +25,17 @@ process.env.ORC_DATA_DIR = path.join(tempDir, "data");
 const { buildArgs, consumeLine, createStreamState } = await import("../src/agents.js");
 const { addProject } = await import("../src/config.js");
 const { db } = await import("../src/db.js");
-const { createTask, failTask, getTask, getTaskDetail, saveSpec, setState } = await import(
-  "../src/board.js"
-);
-const { captureWork, effortFor, parseVerdict, yoloFor } = await import("../src/dispatch.js");
+const { createTask, failTask, getTask, getTaskDetail, saveSpec, setState, updateTask } =
+  await import("../src/board.js");
+const {
+  captureWork,
+  checkConcurrency,
+  effortFor,
+  mergeTask,
+  parseVerdict,
+  recoverWorktrees,
+  yoloFor,
+} = await import("../src/dispatch.js");
 
 function git(cwd, args) {
   return execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true }).trim();
@@ -301,5 +308,145 @@ describe("stream-json parsers", () => {
     );
     assert.equal(state.lastError, "Unknown model slug");
     assert.equal(events.at(-1).kind, "stderr");
+  });
+});
+
+describe("mergeTask", () => {
+  it("refuses dirty main or rebase conflicts and cleanly rebases, merges, archives, and cleans up", async () => {
+    const mergeRepo = path.join(tempDir, "merge-repo");
+    mkdirSync(mergeRepo, { recursive: true });
+    writeFileSync(path.join(mergeRepo, ".gitignore"), ".worktrees/\n.orc/\n", "utf8");
+    writeFileSync(path.join(mergeRepo, "README.md"), "# merge repo\n", "utf8");
+    writeFileSync(path.join(mergeRepo, "shared.txt"), "base\n", "utf8");
+    git(mergeRepo, ["init", "-b", "main"]);
+    git(mergeRepo, ["config", "user.name", "Test User"]);
+    git(mergeRepo, ["config", "user.email", "test@example.invalid"]);
+    git(mergeRepo, ["add", "-A"]);
+    git(mergeRepo, ["commit", "-m", "initial"]);
+
+    const project = addProject({ name: "merge-repo", projectPath: mergeRepo, baseBranch: "main" });
+
+    // Task 1: dirty main + rebase conflict paths
+    const task1 = createTask({
+      projectId: project.id,
+      title: "Conflicting task",
+      description: "Changes shared.txt",
+      acceptance: "- [ ] updated",
+    });
+    const wt1 = path.join(mergeRepo, ".worktrees", task1.id);
+    git(mergeRepo, ["worktree", "add", "-b", task1.branch, wt1, "main"]);
+    writeFileSync(path.join(wt1, "shared.txt"), "task1 change\n", "utf8");
+    git(wt1, ["add", "shared.txt"]);
+    git(wt1, ["commit", "-m", "task1 commit"]);
+    mkdirSync(path.join(wt1, ".orc", task1.id), { recursive: true });
+    writeFileSync(path.join(wt1, ".orc", task1.id, "review.md"), "VERDICT: APPROVE\n", "utf8");
+    updateTask(task1.id, { worktree: wt1 });
+    setState(task1.id, "done");
+
+    // 1) Dirty main refusal
+    writeFileSync(path.join(mergeRepo, "README.md"), "# dirty\n", "utf8");
+    await assert.rejects(() => mergeTask(task1.id), /Main worktree has uncommitted changes/);
+    git(mergeRepo, ["checkout", "--", "README.md"]);
+    assert.ok(getTaskDetail(task1.id).events.some((event) => event.type === "merge.refused"));
+
+    // 2) Rebase conflict refusal + clean abort
+    writeFileSync(path.join(mergeRepo, "shared.txt"), "main conflict\n", "utf8");
+    git(mergeRepo, ["add", "shared.txt"]);
+    git(mergeRepo, ["commit", "-m", "conflicting main commit"]);
+
+    await assert.rejects(() => mergeTask(task1.id), /failed with conflicts/);
+    assert.equal(git(wt1, ["status", "--porcelain", "--untracked-files=no"]), "");
+    assert.ok(existsSync(path.join(wt1, ".orc", task1.id, "review.md")));
+
+    // 3) Successful rebase onto advanced main + fast-forward + cleanup + artifact archive
+    const task2 = createTask({
+      projectId: project.id,
+      title: "Clean feature",
+      description: "Adds extra.js",
+      acceptance: "- [ ] extra.js exists",
+    });
+    const wt2 = path.join(mergeRepo, ".worktrees", task2.id);
+    git(mergeRepo, ["worktree", "add", "-b", task2.branch, wt2, "main"]);
+    writeFileSync(path.join(wt2, "extra.js"), "export const extra = true;\n", "utf8");
+    git(wt2, ["add", "extra.js"]);
+    git(wt2, ["commit", "-m", "task2 commit"]);
+    mkdirSync(path.join(wt2, ".orc", task2.id), { recursive: true });
+    writeFileSync(path.join(wt2, ".orc", task2.id, "review.md"), "VERDICT: APPROVE\n", "utf8");
+    writeFileSync(path.join(wt2, ".orc", task2.id, "diff.patch"), "diff --git a/extra.js\n", "utf8");
+    updateTask(task2.id, { worktree: wt2 });
+    setState(task2.id, "verify");
+
+    // Advance main with a non-conflicting commit so rebase is actually exercised
+    writeFileSync(path.join(mergeRepo, "other.txt"), "ahead on main\n", "utf8");
+    git(mergeRepo, ["add", "other.txt"]);
+    git(mergeRepo, ["commit", "-m", "advance main"]);
+
+    const merged = await mergeTask(task2.id);
+    assert.equal(merged.state, "done");
+    assert.equal(merged.worktree, null);
+    assert.ok(existsSync(path.join(mergeRepo, "extra.js")));
+    assert.ok(existsSync(path.join(mergeRepo, "other.txt")));
+    assert.ok(!existsSync(wt2));
+    assert.equal(git(mergeRepo, ["branch", "--list", task2.branch]), "");
+
+    const detail = getTaskDetail(task2.id);
+    assert.equal(detail.artifacts.reviewExists, true);
+    assert.equal(detail.artifacts.diffExists, true);
+    assert.ok(detail.events.some((event) => event.type === "task.merged"));
+  });
+});
+
+describe("concurrency and worktree recovery", () => {
+  it("enforces per-project lock and global concurrency limit with run.refused events", () => {
+    const dirA = path.join(tempDir, "conc-a");
+    const dirB = path.join(tempDir, "conc-b");
+    mkdirSync(dirA, { recursive: true });
+    mkdirSync(dirB, { recursive: true });
+    const projA = addProject({ name: "conc-a", projectPath: dirA });
+    const projB = addProject({ name: "conc-b", projectPath: dirB });
+
+    const a1 = createTask({ projectId: projA.id, title: "A1", description: "first" });
+    const a2 = createTask({ projectId: projA.id, title: "A2", description: "second" });
+    const b1 = createTask({ projectId: projB.id, title: "B1", description: "other" });
+
+    const active = new Map([[a1.id, { taskId: a1.id, projectId: projA.id }]]);
+
+    assert.throws(() => checkConcurrency(a2, projA, active), /already has an active run/);
+    const a2Events = getTaskDetail(a2.id).events;
+    assert.ok(a2Events.some((event) => event.type === "run.refused"));
+
+    withEnv({ ORC_MAX_CONCURRENCY: "1" }, () => {
+      assert.throws(() => checkConcurrency(b1, projB, active), /global concurrency limit \(1\) reached/);
+      const b1Events = getTaskDetail(b1.id).events;
+      assert.ok(b1Events.some((event) => event.type === "run.refused"));
+    });
+
+    withEnv({ ORC_MAX_CONCURRENCY: "2" }, () => {
+      assert.doesNotThrow(() => checkConcurrency(b1, projB, active));
+    });
+  });
+
+  it("reattaches unlinked worktrees, flags stale in-flight tasks, and reports orphans", () => {
+    const recDir = path.join(tempDir, "recover-repo");
+    mkdirSync(recDir, { recursive: true });
+    const proj = addProject({ name: "recover-repo", projectPath: recDir });
+
+    const staleTask = createTask({ projectId: proj.id, title: "Stale task", description: "interrupted" });
+    setState(staleTask.id, "working");
+
+    const staleWt = path.join(recDir, ".worktrees", staleTask.id);
+    const orphanWt = path.join(recDir, ".worktrees", "T-9999");
+    mkdirSync(staleWt, { recursive: true });
+    mkdirSync(orphanWt, { recursive: true });
+
+    const summary = recoverWorktrees();
+    assert.ok(summary.relinked.some((item) => item.taskId === staleTask.id));
+    assert.ok(summary.staleTasks.some((item) => item.taskId === staleTask.id));
+    assert.ok(summary.orphaned.some((item) => item.worktree === orphanWt));
+
+    assert.equal(getTask(staleTask.id).worktree, staleWt);
+    const events = getTaskDetail(staleTask.id).events;
+    assert.ok(events.some((event) => event.type === "worktree.recovered"));
+    assert.ok(events.some((event) => event.type === "worktree.stale"));
   });
 });

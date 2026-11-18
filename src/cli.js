@@ -21,7 +21,7 @@ import {
   loadConfig,
   resolveProject,
 } from "./config.js";
-import { runningTaskIds, runTask, stopTask } from "./dispatch.js";
+import { mergeTask, recoverWorktrees, runningTaskIds, runTask, stopTask } from "./dispatch.js";
 import { openTarget, revealFile } from "./open.js";
 import { truncate } from "./util.js";
 
@@ -179,6 +179,16 @@ export async function main(argv) {
       if (!id) throw new Error("Usage: node bin/orc.js stop <taskId>");
       stopTask(id);
       console.log(`Stopping ${id}…`);
+      return;
+    }
+
+    case "merge": {
+      const id = positional[1];
+      if (!id) throw new Error("Usage: node bin/orc.js merge <taskId>");
+      const task = await mergeTask(id, { actor: "you" });
+      console.log(`Merged ${task.id} → ${task.state}`);
+      console.log(`  branch  : ${task.branch} (removed)`);
+      console.log(`  worktree: cleaned up`);
       return;
     }
 
@@ -425,6 +435,21 @@ function doctor() {
     if (exists && !isGit) console.log("       ! not a git repository; worktrees will fail");
     if (isGit && !branchOk) console.log(`       ! base branch "${project.baseBranch}" not found`);
   }
+  const recovery = recoverWorktrees();
+  if (recovery.relinked.length || recovery.staleTasks.length || recovery.orphaned.length) {
+    const clean = recovery.staleTasks.length === 0 && recovery.orphaned.length === 0;
+    line(
+      clean,
+      "worktrees",
+      `${recovery.relinked.length} reattached · ${recovery.staleTasks.length} stale · ${recovery.orphaned.length} orphaned`,
+    );
+    for (const stale of recovery.staleTasks) {
+      console.log(`       ! stale ${stale.taskId} (${stale.state}): ${stale.worktree}`);
+    }
+    for (const orphan of recovery.orphaned) {
+      console.log(`       ! orphaned (${orphan.projectId}): ${orphan.worktree}`);
+    }
+  }
   console.log("");
 }
 
@@ -486,6 +511,7 @@ ORC — local mission control for Claude Code and Google Antigravity
   node bin/orc.js list [project]           list tasks
   node bin/orc.js run <taskId>             drive implementation → review → verify
   node bin/orc.js stop <taskId>            stop the active agent process
+  node bin/orc.js merge <taskId>           rebase onto base, clean worktree, mark done
   node bin/orc.js state <taskId> <state>   move a task manually
   node bin/orc.js done <taskId>            mark done
   node bin/orc.js block <taskId>           mark blocked (needs a human)
