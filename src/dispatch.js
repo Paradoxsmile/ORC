@@ -128,11 +128,11 @@ export async function runTask(taskId, { actor = "you" } = {}) {
   }
 }
 
-function reviewerFor(implementer) {
+export function reviewerFor(implementer) {
   return implementer === "agy" ? "claude" : "agy";
 }
 
-function modelFor(agent, role) {
+export function modelFor(agent, role) {
   if (agent === "agy") {
     const specific = role === "review" ? "ORC_AGY_REVIEW_MODEL" : "ORC_AGY_IMPL_MODEL";
     return process.env[specific] || process.env.ORC_AGY_MODEL || null;
@@ -141,12 +141,17 @@ function modelFor(agent, role) {
   return process.env[specific] || process.env.ORC_CLAUDE_MODEL || null;
 }
 
-function effortFor(agent, role) {
+export function effortFor(agent, role) {
   if (agent !== "agy") return null;
   const model = modelFor(agent, role);
   // Orchestrator uses a fixed configuration and rejects --effort.
   if (model && model.includes("orchestrator")) return null;
   return process.env.ORC_AGY_EFFORT || null;
+}
+
+export function yoloFor(agent, role) {
+  if (agent !== "agy" || role !== "impl") return false;
+  return /^(1|true|yes)$/i.test(String(process.env.ORC_AGY_YOLO ?? "").trim());
 }
 
 function cancelledError() {
@@ -266,7 +271,7 @@ async function implementStep(task, project, controller) {
       mode: implementer === "agy" ? "accept-edits" : null,
       model: modelFor(implementer, "impl"),
       effort: effortFor(implementer, "impl"),
-      yolo: implementer === "agy",
+      yolo: yoloFor(implementer, "impl"),
       timeoutMs: AGENT_TIMEOUT_MS,
       taskId: task.id,
       runId,
@@ -561,13 +566,16 @@ function buildReviewPrompt(task, project) {
   return `${lines.join("\n")}\n`;
 }
 
-function parseVerdict(text) {
-  const match = String(text ?? "").match(/VERDICT:\s*(APPROVE|REQUEST\s+CHANGES)/i);
-  if (!match) return null;
-  return /APPROVE/i.test(match[1]) ? "approve" : "request_changes";
+export function parseVerdict(text) {
+  const matches = [
+    ...String(text ?? "").matchAll(/[*`\s]*VERDICT:\s*(APPROVE|REQUEST\s+CHANGES)\b[*`\s.]*$/gim),
+  ];
+  const last = matches.at(-1);
+  if (!last) return null;
+  return /APPROVE/i.test(last[1]) ? "approve" : "request_changes";
 }
 
-async function captureWork(worktree, task, project, label, before) {
+export async function captureWork(worktree, task, project, label, before) {
   const base = project.baseBranch || "main";
 
   // Stage everything, then unstage artifacts. This also works when the project

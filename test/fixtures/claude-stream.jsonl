@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"claude-sess-42","model":"claude-sonnet-4-5"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Inspecting repository...\n"},{"type":"tool_use","name":"Read","input":{"file_path":"src/index.js"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":"export const ok = true;"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Applied fix.\n"}]}}
+{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.012,"result":"Inspecting repository...\nApplied fix.\n","session_id":"claude-sess-42"}

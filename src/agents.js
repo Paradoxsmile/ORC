@@ -100,14 +100,7 @@ export async function runAgent({
     throw error;
   }
 
-  const state = {
-    sessionId: sessionId ?? null,
-    initEmitted: false,
-    text: "",
-    raw: [],
-    lastError: null,
-    steps: new Map(),
-  };
+  const state = createStreamState(sessionId);
 
   onSpawn(child);
 
@@ -181,7 +174,18 @@ export function killTree(child) {
   }
 }
 
-function buildArgs(agent, prompt, { sessionId, mode, model, effort, yolo }) {
+export function createStreamState(sessionId = null) {
+  return {
+    sessionId: sessionId ?? null,
+    initEmitted: false,
+    text: "",
+    raw: [],
+    lastError: null,
+    steps: new Map(),
+  };
+}
+
+export function buildArgs(agent, prompt, { sessionId, mode, model, effort, yolo }) {
   if (agent === "claude") {
     const review = mode === "plan";
     const args = [
@@ -224,7 +228,7 @@ function quoteCmd(value) {
   return `"${text.replace(/"/g, '""')}"`;
 }
 
-function consumeLine(agent, line, state, onEvent) {
+export function consumeLine(agent, line, state, onEvent) {
   let event;
   try {
     event = JSON.parse(line);

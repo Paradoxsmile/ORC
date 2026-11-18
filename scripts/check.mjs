@@ -27,6 +27,9 @@ const REQUIRED = [
   "templates/adr.md",
   "README.md",
   "scripts/smoke.mjs",
+  "test/orc.test.mjs",
+  "test/fixtures/claude-stream.jsonl",
+  "test/fixtures/agy-stream.jsonl",
   "docs/decisions/ADR-0001-orchestrate-official-clis.md",
 ];
 
@@ -48,6 +51,7 @@ const jsFiles = [
   ...walk(path.join(ROOT, "bin")),
   ...walk(path.join(ROOT, "src")),
   ...walk(path.join(ROOT, "scripts")),
+  ...walk(path.join(ROOT, "test")),
   ...walk(path.join(ROOT, "public")),
 ];
 

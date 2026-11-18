@@ -125,6 +125,7 @@ node bin/orc.js block <taskId> [--note "..."]
 node bin/orc.js status
 node bin/orc.js open [task|project] [--spec] [--project]
 node scripts/check.mjs
+node --test
 node scripts/smoke.mjs
 ```
 
@@ -198,6 +199,7 @@ models with environment variables:
 | `ORC_AGY_MODEL` | default Antigravity model |
 | `ORC_AGY_IMPL_MODEL` / `ORC_AGY_REVIEW_MODEL` | role-specific Antigravity model |
 | `ORC_AGY_EFFORT` | `low`, `medium`, `high`, `xhigh`, `max` (ignored for Orchestrator) |
+| `ORC_AGY_YOLO` | `1` to opt into `--dangerously-skip-permissions` on Antigravity implementation (off by default) |
 
 Antigravity model slugs come from `agy models`. As of November 2026, relevant ones are:
 
@@ -298,6 +300,7 @@ src/open.js         Explorer/file reveal
 public/             dashboard (vanilla JS, no build)
 templates/          files copied into managed projects
 scripts/check.mjs   syntax + required-file check
+test/               unit tests (`node --test`) and stream fixtures
 docs/decisions/     ADRs for ORC itself
 ```
 
@@ -307,25 +310,26 @@ docs/decisions/     ADRs for ORC itself
 
 ```powershell
 node scripts/check.mjs   # syntax + required files
+node --test              # offline unit tests (verdict, states, git, stream parsers)
 node scripts/smoke.mjs   # fake CLIs, real git, real HTTP/SSE plumbing
 ```
 
-The smoke test creates a temporary git repo and fake `claude`/`agy` binaries on
-`PATH`. It runs a full task through implementation, diff capture, review, tests, and
-`done`, then checks the branch, worktree, artifacts, and API. It uses temporary
-`ORC_CONFIG` and `ORC_DATA_DIR` paths, so it does not touch the real board. On success
-it prints a temp path that is safe to delete.
+The unit suite (`node --test`) runs offline with no network and no vendor CLIs, using
+temporary `ORC_CONFIG` and `ORC_DATA_DIR` paths. The smoke test creates a temporary git
+repo and fake `claude`/`agy` binaries on `PATH`. It runs a full task through implementation,
+diff capture, review, tests, and `done`, then checks the branch, worktree, artifacts, and
+API. On success it prints a temp path that is safe to delete.
 
 ## 11. Auth and terms
 - Install Claude Code, run `claude` once, complete login. ORC reuses the cached login.
 - Install Antigravity CLI, run `agy` once, complete login. Headless runs use cached
   credentials; without them `agy` exits with an authentication error.
 - Each vendor enforces its own quota and terms. ORC does not circumvent either.
-- Antigravity implementation currently runs with `--dangerously-skip-permissions`
-  because headless tool approval cannot prompt. This is the highest-risk setting in the
-  scaffold. Prefer scoped `permissions.allow` rules in
-  `~/.gemini/antigravity-cli/settings.json`, or change the adapter before using it on
-  repositories you do not trust. The worktree limits file scope, not shell scope.
+- Antigravity implementation defaults to `--mode accept-edits` **without**
+  `--dangerously-skip-permissions`. Prefer scoped `permissions.allow` rules in
+  `~/.gemini/antigravity-cli/settings.json`. Only set `ORC_AGY_YOLO=1` in trusted
+  repositories if headless tool approval stalls. Remember the worktree limits file scope,
+  not shell scope.
 - Claude headless implements with `--permission-mode acceptEdits` and
   `--allowedTools "Read,Edit,Write,Bash"`. Reviews run with `--permission-mode plan`
   and read-only tools (`Read,Grep,Glob,Bash`).
@@ -335,7 +339,7 @@ it prints a temp path that is safe to delete.
 ## 12. Known gaps
 
 - End-to-end agent execution is **untested with the real CLIs**: neither `claude` nor
-  `agy` is installed on this machine. The fake-CLI smoke test passes.
+  `agy` is installed on this machine. Unit tests and the fake-CLI smoke test pass.
 - Antigravity `stream-json` parsing covers `init` / `step_update` / `result` envelopes,
   but has not been exercised against a real `agy`.
 - No merge, push, or pull-request automation. Branches stay for manual review.
@@ -344,7 +348,6 @@ it prints a temp path that is safe to delete.
 - The dashboard shows raw markdown; it does not render it.
 - Review verdicts are parsed from text; a missing verdict blocks the task.
 - Windows-first process killing (`taskkill /T /F`); POSIX uses process groups.
-- `scripts/check.mjs` is a syntax/required-file check, not a test suite.
 - Model defaults come from the CLIs unless the environment variables above are set.
 
 ---
@@ -352,9 +355,7 @@ it prints a temp path that is safe to delete.
 ## 13. Next steps
 
 1. Install `claude` and `agy`, authenticate, run `node bin/orc.js doctor`.
-2. Run one throwaway task in a scratch git repo and verify the real stream formats.
-3. Add scoped Antigravity permissions instead of `--dangerously-skip-permissions`.
-4. Add a merge command that rebases the task branch and removes the worktree.
-5. Add a global concurrency limit and a per-project lock.
-6. Add tests around the state machine, verdict parser, and worktree recovery.
-7. Add model selection to the UI (per project and per role).
+2. Run one throwaway task in a scratch git repo and verify the real stream formats and scoped `agy` permissions.
+3. Add a merge command (`orc merge`) that rebases the task branch and removes the worktree.
+4. Add a global concurrency limit, per-project lock, and stale worktree recovery.
+5. Add model selection to the UI (per project and per role).
