@@ -220,7 +220,11 @@ export function getTaskDetail(id) {
   const testPath = artifactsDir ? path.join(artifactsDir, "test.log") : null;
 
   const events = db
-    .prepare("SELECT * FROM events WHERE task_id = ? ORDER BY id ASC LIMIT 500")
+    .prepare(
+      `SELECT * FROM (
+         SELECT * FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 500
+       ) ORDER BY id ASC`,
+    )
     .all(id)
     .map((event) => ({
       ...event,

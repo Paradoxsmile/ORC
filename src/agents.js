@@ -158,20 +158,26 @@ export async function runAgent({
   };
 }
 
-export function killTree(child) {
-  if (!child || child.exitCode !== null) return;
+export function killPidTree(pid) {
+  const id = Number(pid);
+  if (!Number.isInteger(id) || id <= 0) return;
   try {
     if (process.platform === "win32") {
-      execFileSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+      execFileSync("taskkill", ["/pid", String(id), "/T", "/F"], {
         windowsHide: true,
         stdio: "ignore",
       });
     } else {
-      process.kill(-child.pid, "SIGTERM");
+      process.kill(-id, "SIGTERM");
     }
   } catch {
     // The process may already be gone.
   }
+}
+
+export function killTree(child) {
+  if (!child || child.exitCode !== null) return;
+  killPidTree(child.pid);
 }
 
 export function createStreamState(sessionId = null) {
@@ -222,8 +228,8 @@ function wrapWindows(file, args) {
   return { file, argv: args };
 }
 
-function quoteCmd(value) {
-  const text = String(value);
+export function quoteCmd(value) {
+  const text = String(value).replace(/\r?\n/g, " ").replace(/%/g, "%%");
   if (!/[\s"&|<>^()]/.test(text)) return text;
   return `"${text.replace(/"/g, '""')}"`;
 }

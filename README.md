@@ -211,6 +211,7 @@ models with environment variables:
 | `ORC_AGY_IMPL_MODEL` / `ORC_AGY_REVIEW_MODEL` | role-specific Antigravity model |
 | `ORC_AGY_EFFORT` | `low`, `medium`, `high`, `xhigh`, `max` (ignored for Orchestrator) |
 | `ORC_AGY_YOLO` | `1` to opt into `--dangerously-skip-permissions` on Antigravity implementation (off by default) |
+| `ORC_REVIEWER` | `claude`, `agy`, `same`, or `auto` (falls back to the implementer CLI in a fresh `plan` session when only one CLI is installed) |
 
 Antigravity model slugs come from `agy models`. As of November 2026, relevant ones are:
 

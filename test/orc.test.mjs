@@ -22,18 +22,20 @@ const tempDir = mkdtempSync(path.join(os.tmpdir(), "orc-unit-"));
 process.env.ORC_CONFIG = path.join(tempDir, "orc.config.json");
 process.env.ORC_DATA_DIR = path.join(tempDir, "data");
 
-const { buildArgs, consumeLine, createStreamState } = await import("../src/agents.js");
+const { buildArgs, consumeLine, createStreamState, quoteCmd } = await import("../src/agents.js");
 const { addProject } = await import("../src/config.js");
-const { db } = await import("../src/db.js");
+const { db, isPidAlive, reapDeadRuns } = await import("../src/db.js");
 const { createTask, failTask, getTask, getTaskDetail, saveSpec, setState, updateTask } =
   await import("../src/board.js");
 const {
   captureWork,
   checkConcurrency,
+  createEventCoalescer,
   effortFor,
   mergeTask,
   parseVerdict,
   recoverWorktrees,
+  reviewerFor,
   yoloFor,
 } = await import("../src/dispatch.js");
 
@@ -448,5 +450,74 @@ describe("concurrency and worktree recovery", () => {
     const events = getTaskDetail(staleTask.id).events;
     assert.ok(events.some((event) => event.type === "worktree.recovered"));
     assert.ok(events.some((event) => event.type === "worktree.stale"));
+  });
+});
+
+describe("hardening: cmd quoting, PID reaping, event coalescing, reviewer fallback", () => {
+  it("escapes %VAR% and newlines in quoteCmd", () => {
+    assert.equal(quoteCmd("line1\nline2 %PATH%"), '"line1 line2 %%PATH%%"');
+  });
+
+  it("reaps only dead PIDs in reapDeadRuns and preserves live PIDs", () => {
+    assert.equal(isPidAlive(process.pid), true);
+    db.prepare(
+      "INSERT INTO runs (id, task_id, agent, step, pid, status, started_at) VALUES (?, ?, ?, ?, ?, 'running', ?)",
+    ).run("R-live", "T-0001", "claude", "implementation", process.pid, "2026-11-18T00:00:00.000Z");
+    db.prepare(
+      "INSERT INTO runs (id, task_id, agent, step, pid, status, started_at) VALUES (?, ?, ?, ?, ?, 'running', ?)",
+    ).run("R-dead", "T-0001", "claude", "implementation", 99999999, "2026-11-18T00:00:00.000Z");
+
+    const reaped = reapDeadRuns();
+    assert.ok(reaped.includes("R-dead"));
+    assert.ok(!reaped.includes("R-live"));
+
+    const liveRow = db.prepare("SELECT status FROM runs WHERE id = 'R-live'").get();
+    const deadRow = db.prepare("SELECT status FROM runs WHERE id = 'R-dead'").get();
+    assert.equal(liveRow.status, "running");
+    assert.equal(deadRow.status, "interrupted");
+
+    db.prepare("DELETE FROM runs WHERE id IN ('R-live', 'R-dead')").run();
+  });
+
+  it("coalesces consecutive agent text deltas and flushes before tool events", () => {
+    const emitted = [];
+    const coalescer = createEventCoalescer("T-0001", "R-1", "claude", {
+      flushMs: 5000,
+      maxChars: 1000,
+      emit: (_taskId, _runId, _agent, event) => emitted.push(event),
+    });
+
+    coalescer.push({ kind: "text", text: "Hello " });
+    coalescer.push({ kind: "text", text: "world" });
+    coalescer.push({ kind: "tool", text: "Read" });
+    coalescer.push({ kind: "text", text: "Done." });
+    coalescer.flush();
+
+    assert.deepEqual(emitted, [
+      { kind: "text", text: "Hello world" },
+      { kind: "tool", text: "Read" },
+      { kind: "text", text: "Done." },
+    ]);
+  });
+
+  it("supports ORC_REVIEWER overrides and single-CLI auto fallback", () => {
+    assert.equal(reviewerFor("claude", { env: {} }), "agy");
+    assert.equal(reviewerFor("agy", { env: {} }), "claude");
+    assert.equal(reviewerFor("claude", { env: { ORC_REVIEWER: "same" } }), "claude");
+    assert.equal(reviewerFor("claude", { env: { ORC_REVIEWER: "claude" } }), "claude");
+    assert.equal(
+      reviewerFor("claude", {
+        env: { ORC_REVIEWER: "auto" },
+        health: { claude: { available: true }, agy: { available: false } },
+      }),
+      "claude",
+    );
+    assert.equal(
+      reviewerFor("claude", {
+        env: { ORC_REVIEWER: "auto" },
+        health: { claude: { available: true }, agy: { available: true } },
+      }),
+      "agy",
+    );
   });
 });

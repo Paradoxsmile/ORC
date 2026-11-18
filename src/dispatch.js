@@ -2,7 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { cpSync, existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { agentLabel, detectAgents, killTree, runAgent } from "./agents.js";
+import { agentLabel, detectAgents, killPidTree, killTree, runAgent } from "./agents.js";
 import {
   addEvent,
   bus,
@@ -13,7 +13,7 @@ import {
   updateTask,
 } from "./board.js";
 import { ensureProjectGitignore, listProjects, loadConfig, resolveProject } from "./config.js";
-import { db } from "./db.js";
+import { db, isPidAlive, reapDeadRuns } from "./db.js";
 import { ensureDir, nowIso, readText, truncate } from "./util.js";
 
 const execFileP = promisify(execFile);
@@ -35,12 +35,28 @@ export function isRunning(taskId) {
 
 export function stopTask(taskId) {
   const run = running.get(taskId);
-  if (!run) throw new Error(`${taskId} is not running`);
-  run.cancelled = true;
-  addEvent({ taskId, actor: "you", type: "run.stop_requested", text: "Stop requested" });
-  if (run.child) killTree(run.child);
-  bus.emit("refresh");
-  return true;
+  if (run) {
+    run.cancelled = true;
+    addEvent({ taskId, actor: "you", type: "run.stop_requested", text: "Stop requested" });
+    if (run.child) killTree(run.child);
+    bus.emit("refresh");
+    return true;
+  }
+
+  const activeRow = db
+    .prepare("SELECT id, pid FROM runs WHERE task_id = ? AND status = 'running' ORDER BY started_at DESC LIMIT 1")
+    .get(taskId);
+  if (activeRow?.pid && isPidAlive(activeRow.pid)) {
+    addEvent({ taskId, actor: "you", type: "run.stop_requested", text: "Stop requested (cross-process)" });
+    killPidTree(activeRow.pid);
+    db.prepare("UPDATE runs SET status = 'stopped', ended_at = ? WHERE id = ?").run(nowIso(), activeRow.id);
+    addEvent({ taskId, actor: "orc", type: "run.stopped", text: "Stopped by user" });
+    if (getTask(taskId)?.state !== "blocked") failTask(taskId, "Stopped by user");
+    bus.emit("refresh");
+    return true;
+  }
+
+  throw new Error(`${taskId} is not running`);
 }
 
 export { MAX_PIPELINE_STEPS };
@@ -111,6 +127,7 @@ export function checkConcurrency(task, project, active = running) {
  * reattaches missing paths, flags stale in-flight tasks, or reports orphans.
  */
 export function recoverWorktrees() {
+  const reapedRuns = reapDeadRuns();
   const relinked = [];
   const staleTasks = [];
   const orphaned = [];
@@ -150,8 +167,8 @@ export function recoverWorktrees() {
     }
   }
 
-  if (relinked.length || staleTasks.length) bus.emit("refresh");
-  return { relinked, staleTasks, orphaned };
+  if (relinked.length || staleTasks.length || reapedRuns.length) bus.emit("refresh");
+  return { relinked, staleTasks, orphaned, reapedRuns };
 }
 
 /**
@@ -362,8 +379,17 @@ export async function runTask(taskId, { actor = "you" } = {}) {
   }
 }
 
-export function reviewerFor(implementer) {
-  return implementer === "agy" ? "claude" : "agy";
+export function reviewerFor(implementer, { env = process.env, health = null } = {}) {
+  const opposite = implementer === "agy" ? "claude" : "agy";
+  const override = String(env.ORC_REVIEWER ?? "").trim().toLowerCase();
+  if (override === "claude" || override === "agy") return override;
+  if (override === "same") return implementer === "agy" ? "agy" : "claude";
+  if (override === "auto") {
+    const detected = health ?? detectAgents();
+    if (detected[opposite]?.available) return opposite;
+    return implementer === "agy" ? "agy" : "claude";
+  }
+  return opposite;
 }
 
 export function modelFor(agent, role) {
@@ -492,14 +518,16 @@ async function implementStep(task, project, controller) {
     data: { prompt: path.join(artifactsDir, "prompt-implement.md") },
   });
   writeFileSync(path.join(artifactsDir, "prompt-implement.md"), prompt, "utf8");
+  const cliPrompt = `Read and follow .orc/${task.id}/prompt-implement.md in this worktree.`;
 
   const before = (await git(worktree, ["rev-parse", "HEAD"], { allowFailure: true })).stdout.trim();
+  const coalescer = createEventCoalescer(task.id, runId, implementer);
 
   let result;
   try {
     result = await runAgent({
       agent: implementer,
-      prompt,
+      prompt: cliPrompt,
       cwd: worktree,
       sessionId,
       mode: implementer === "agy" ? "accept-edits" : null,
@@ -513,13 +541,15 @@ async function implementStep(task, project, controller) {
         controller.child = child;
         setRunPid(runId, child.pid);
       },
-      onEvent: (event) => recordAgentEvent(task.id, runId, implementer, event),
+      onEvent: (event) => coalescer.push(event),
     });
   } catch (error) {
+    coalescer.flush();
     controller.child = null;
     finishRun(runId, { code: -1, error: error.message });
     throw error;
   }
+  coalescer.flush();
 
   controller.child = null;
   finishRun(runId, result, controller.cancelled);
@@ -565,6 +595,7 @@ async function reviewStep(task, project, controller) {
   const reviewer = reviewerFor(task.agent);
   const prompt = buildReviewPrompt(task, project);
   writeFileSync(path.join(artifactsDir, "prompt-review.md"), prompt, "utf8");
+  const cliPrompt = `Read and follow .orc/${task.id}/prompt-review.md in this worktree.`;
 
   const runId = startRun(task.id, reviewer, "review");
   addEvent({
@@ -575,11 +606,12 @@ async function reviewStep(task, project, controller) {
     text: "Reviewing the diff against the spec",
   });
 
+  const coalescer = createEventCoalescer(task.id, runId, reviewer);
   let result;
   try {
     result = await runAgent({
       agent: reviewer,
-      prompt,
+      prompt: cliPrompt,
       cwd: task.worktree,
       mode: "plan",
       model: modelFor(reviewer, "review"),
@@ -591,13 +623,15 @@ async function reviewStep(task, project, controller) {
         controller.child = child;
         setRunPid(runId, child.pid);
       },
-      onEvent: (event) => recordAgentEvent(task.id, runId, reviewer, event),
+      onEvent: (event) => coalescer.push(event),
     });
   } catch (error) {
+    coalescer.flush();
     controller.child = null;
     finishRun(runId, { code: -1, error: error.message });
     throw error;
   }
+  coalescer.flush();
 
   controller.child = null;
   finishRun(runId, result, controller.cancelled);
@@ -864,6 +898,47 @@ function finishRun(runId, result, cancelled = false) {
     result.code ?? null,
     runId,
   );
+}
+
+/**
+ * Coalesces consecutive agent text deltas to prevent per-token SQLite/SSE flooding.
+ */
+export function createEventCoalescer(
+  taskId,
+  runId,
+  agent,
+  { flushMs = 400, maxChars = 1000, emit = recordAgentEvent } = {},
+) {
+  let buffer = "";
+  let timer = null;
+
+  const flush = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (!buffer) return;
+    const text = buffer;
+    buffer = "";
+    emit(taskId, runId, agent, { kind: "text", text });
+  };
+
+  const push = (event) => {
+    if (event?.kind === "text" && typeof event.text === "string") {
+      buffer += event.text;
+      if (buffer.length >= maxChars) {
+        flush();
+      } else if (!timer && flushMs > 0) {
+        timer = setTimeout(flush, flushMs);
+        timer.unref?.();
+      }
+      return;
+    }
+    flush();
+    emit(taskId, runId, agent, event);
+  };
+
+  return { push, flush };
 }
 
 function recordAgentEvent(taskId, runId, agent, event) {

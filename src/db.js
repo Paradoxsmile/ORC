@@ -80,5 +80,29 @@ export function tx(fn) {
   }
 }
 
-// A server restart can leave runs marked "running" forever.
-db.prepare("UPDATE runs SET status = 'interrupted', ended_at = ? WHERE status = 'running'").run(nowIso());
+export function isPidAlive(pid) {
+  const id = Number(pid);
+  if (!Number.isInteger(id) || id <= 0) return false;
+  try {
+    process.kill(id, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * Marks stale "running" rows as interrupted only when their PID is no longer alive.
+ */
+export function reapDeadRuns() {
+  const rows = db.prepare("SELECT id, pid FROM runs WHERE status = 'running'").all();
+  const reaped = [];
+  const ts = nowIso();
+  for (const row of rows) {
+    if (!row.pid || !isPidAlive(row.pid)) {
+      db.prepare("UPDATE runs SET status = 'interrupted', ended_at = ? WHERE id = ?").run(ts, row.id);
+      reaped.push(row.id);
+    }
+  }
+  return reaped;
+}
