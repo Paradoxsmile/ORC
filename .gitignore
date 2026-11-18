@@ -1,0 +1,8 @@
+node_modules/
+data/
+.worktrees/
+.orc/
+*.log
+.env
+STATUS.md
+

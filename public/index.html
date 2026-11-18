@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ORC — mission control</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">ORC</span>
+        <span class="brand-sub">mission control</span>
+      </div>
+      <div class="top-actions">
+        <div class="health" id="health" aria-label="CLI health"></div>
+        <button class="btn ghost" data-action="refresh" title="Reload state">Refresh</button>
+        <button class="btn ghost" data-action="new-project">+ Project</button>
+        <button class="btn primary" data-action="new-task">+ Task</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="side-head">
+          <span>Projects</span>
+          <span class="side-count" id="projectCount"></span>
+        </div>
+        <nav class="project-list" id="projectList"></nav>
+        <div class="side-foot" id="sideFoot"></div>
+      </aside>
+
+      <main class="main">
+        <section class="hero">
+          <div class="hero-copy">
+            <h1 id="viewTitle">All projects</h1>
+            <p id="viewSub">Loading…</p>
+          </div>
+          <div class="stats" id="stats"></div>
+        </section>
+
+        <section class="toolbar">
+          <input
+            id="search"
+            class="search"
+            type="search"
+            placeholder="Search tasks, ids, branches…  (press /)"
+            autocomplete="off"
+          />
+          <span class="toolbar-note" id="toolbarNote"></span>
+        </section>
+
+        <section class="board" id="board" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <div id="drawerRoot"></div>
+    <div id="modalRoot"></div>
+    <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+  </body>
+</html>
