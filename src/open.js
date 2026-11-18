@@ -2,11 +2,12 @@ import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 
-function launch(file, args) {
+function launch(file, args, options = {}) {
   const child = spawn(file, args, {
     detached: true,
     stdio: "ignore",
-    windowsHide: true,
+    windowsHide: process.platform !== "win32",
+    ...options,
   });
   child.on("error", () => {});
   child.unref();
@@ -36,7 +37,7 @@ export function revealFile(file) {
     if (statSync(abs).isDirectory()) {
       launch("explorer.exe", [abs]);
     } else {
-      launch("explorer.exe", [`/select,${abs}`]);
+      launch("explorer.exe", [`/select,"${abs}"`], { windowsVerbatimArguments: true });
     }
     return abs;
   }
