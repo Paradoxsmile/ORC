@@ -5,11 +5,11 @@ human. ORC is a thin orchestrator over the official CLIs. It never calls a model
 never stores OAuth tokens, and never pools quota. Claude keeps its login; Antigravity
 keeps its login.
 
-> Status: **v0.1 scaffold**. The board, task/spec model, worktrees, dispatch loop,
-> review loop, dashboard, and a fake-CLI smoke test are implemented. The CLI adapters
-> are written against the documented headless formats, but this machine does not have
-> `claude` or `agy` installed yet, so the full agent loop has not been exercised against
-> the real CLIs.
+> Status: **v0.2**. The board, task/spec model, worktrees, dispatch loop, review loop,
+> local merge cleanup, concurrency locks, worktree recovery, dashboard, offline unit tests,
+> and fake-CLI smoke test are implemented. Both `claude` (`2.1.327`) and `agy` (`1.5.11`)
+> have been probed headlessly with `node scripts/probe.mjs` (all expected flags and
+> `stream-json` envelopes verified). Full multi-step real-CLI task runs are ready to try.
 
 ---
 
@@ -356,12 +356,20 @@ prints a temp path that is safe to delete.
 
 ---
 
-## 12. Known gaps
+## 12. Known gaps & real-CLI probe notes
 
-- End-to-end agent execution is **untested with the real CLIs**: neither `claude` nor
-  `agy` is installed on this machine. Unit tests and the fake-CLI smoke test pass.
-- Antigravity `stream-json` parsing covers `init` / `step_update` / `result` envelopes,
-  but has not been exercised against a real `agy`.
+Real-CLI probe findings (`node scripts/probe.mjs` on Windows 11):
+- **Claude Code `2.1.327`**: confirmed `stream-json`, `--permission-mode`, `--allowedTools`,
+  `--resume`, `--model`. Observed events: `system` (`init`, `commands_changed`), `assistant`,
+  `rate_limit_event` (now normalized as `agent.rate_limit`), and `result`.
+- **Google Antigravity `1.5.11`**: confirmed `stream-json`, `--mode`, `--conversation`,
+  `--model`, `--effort`. Observed events: `init` (`permission_mode: "request-review"` in
+  `--mode plan`), `step_update` (`user_input`, `agent_response` with incremental deltas),
+  and `result` (`status: "SUCCESS"`, authoritative `response`).
+
+Remaining gaps:
+- Full multi-step `implement → review → verify → merge` runs have been verified with fake
+  CLIs, not yet with real `claude` + `agy` tasks.
 - No remote push or pull-request automation (`orc merge` is local rebase + fast-forward only).
 - No authentication; localhost only.
 - The dashboard shows raw markdown; it does not render it.
@@ -373,7 +381,6 @@ prints a temp path that is safe to delete.
 
 ## 13. Next steps
 
-1. Install `claude` and `agy`, authenticate, and run `node bin/orc.js doctor`.
-2. Run `node scripts/probe.mjs` and inspect `data/probes/` to verify real `--help` flags, stream JSONL shapes, and scoped `agy` permissions.
-3. Run one throwaway task in a scratch git repo end-to-end (`run` → `done` → `merge`).
-4. Add model selection to the UI (per project and per role).
+1. Run one throwaway task in a scratch git repo end-to-end with real `claude` + `agy` (`run` → `done` → `merge`) and verify scoped `agy` permissions in `--mode accept-edits`.
+2. Add model selection to the UI (per project and per role).
+3. Render formatted markdown and colorized diffs in the task drawer.

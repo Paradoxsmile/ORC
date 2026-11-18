@@ -270,6 +270,18 @@ describe("stream-json parsers", () => {
     );
     assert.equal(state.lastError, "Quota exceeded");
     assert.equal(events.at(-1).kind, "stderr");
+
+    consumeLine(
+      "claude",
+      JSON.stringify({
+        type: "rate_limit_event",
+        rate_limit_info: { status: "allowed_warning", rateLimitType: "seven_day", utilization: 0.95 },
+      }),
+      state,
+      (event) => events.push(event),
+    );
+    assert.equal(events.at(-1).kind, "rate_limit");
+    assert.equal(events.at(-1).text, "allowed_warning · seven_day · 95%");
   });
 
   it("parses Antigravity stream-json fixture with suffix-diff deduplication and error results", () => {

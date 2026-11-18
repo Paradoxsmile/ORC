@@ -335,6 +335,14 @@ export function consumeLine(agent, line, state, onEvent) {
     return;
   }
 
+  if (event.type === "rate_limit_event") {
+    const info = event.rate_limit_info ?? {};
+    const pct = Number.isFinite(info.utilization) ? `${Math.round(info.utilization * 100)}%` : "";
+    const parts = [info.status || "rate_limit", info.rateLimitType, pct].filter(Boolean);
+    onEvent({ kind: "rate_limit", text: parts.join(" · "), data: info });
+    return;
+  }
+
   const text =
     typeof event.text === "string"
       ? event.text
