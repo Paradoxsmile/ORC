@@ -7,7 +7,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SKIP = new Set(["node_modules", ".git", ".worktrees", ".orc", "data", "smoke_work"]);
 const REQUIRED = [
   "package.json",
-  "orc.config.json",
+  "orc.config.example.json",
   "bin/orc.js",
   "src/cli.js",
   "src/server.js",
@@ -33,6 +33,7 @@ const REQUIRED = [
   "test/fixtures/agy-stream.jsonl",
   "docs/decisions/ADR-0001-orchestrate-official-clis.md",
   "docs/decisions/ADR-0002-worktree-merge-and-concurrency.md",
+  "skills/orc-orchestrator/SKILL.md",
 ];
 
 function walk(dir, output = []) {
@@ -74,7 +75,7 @@ for (const file of jsFiles) {
   }
 }
 
-const jsonFiles = ["package.json", "orc.config.json"];
+const jsonFiles = ["package.json", "orc.config.example.json"];
 for (const relative of jsonFiles) {
   const file = path.join(ROOT, relative);
   try {

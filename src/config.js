@@ -36,7 +36,16 @@ export function resolveProject(ref) {
   ) ?? null;
 }
 
-export function addProject({ name, projectPath, baseBranch = "main", testCommand = "" }) {
+export function addProject({
+  name,
+  projectPath,
+  baseBranch = "main",
+  testCommand = "",
+  setupCommand = "",
+  reviewer = "",
+  implModel = "",
+  reviewModel = "",
+}) {
   const config = loadConfig();
   const abs = path.resolve(String(projectPath ?? "").trim());
   if (!projectPath || !existsSync(abs) || !statSync(abs).isDirectory()) {
@@ -61,12 +70,55 @@ export function addProject({ name, projectPath, baseBranch = "main", testCommand
     id,
     name: displayName,
     path: abs,
-    baseBranch: baseBranch || "main",
-    testCommand: testCommand || "",
+    baseBranch: String(baseBranch || "main").trim() || "main",
+    testCommand: String(testCommand || "").trim(),
+    setupCommand: String(setupCommand || "").trim(),
+    reviewer: normalizeReviewer(reviewer),
+    implModel: String(implModel || "").trim(),
+    reviewModel: String(reviewModel || "").trim(),
   };
   config.projects.push(project);
   saveConfig(config);
   return project;
+}
+
+export function updateProject(ref, patch = {}) {
+  const config = loadConfig();
+  const needle = String(ref ?? "").toLowerCase();
+  const project = config.projects.find(
+    (item) => item.id.toLowerCase() === needle || item.name.toLowerCase() === needle,
+  );
+  if (!project) throw new Error(`Unknown project: ${ref}`);
+
+  if (patch.name !== undefined && String(patch.name).trim()) {
+    project.name = String(patch.name).trim();
+  }
+  if (patch.baseBranch !== undefined) {
+    project.baseBranch = String(patch.baseBranch).trim() || "main";
+  }
+  if (patch.testCommand !== undefined) {
+    project.testCommand = String(patch.testCommand).trim();
+  }
+  if (patch.setupCommand !== undefined) {
+    project.setupCommand = String(patch.setupCommand).trim();
+  }
+  if (patch.reviewer !== undefined) {
+    project.reviewer = normalizeReviewer(patch.reviewer);
+  }
+  if (patch.implModel !== undefined) {
+    project.implModel = String(patch.implModel).trim();
+  }
+  if (patch.reviewModel !== undefined) {
+    project.reviewModel = String(patch.reviewModel).trim();
+  }
+
+  saveConfig(config);
+  return project;
+}
+
+function normalizeReviewer(value) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  return ["", "claude", "agy", "same", "auto"].includes(clean) ? clean : "";
 }
 
 export function initProject(project) {

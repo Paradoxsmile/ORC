@@ -4,5 +4,6 @@ data/
 .orc/
 *.log
 .env
+orc.config.json
 STATUS.md
 

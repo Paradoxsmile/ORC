@@ -131,6 +131,7 @@ async function main() {
       projectPath: repoDir,
       baseBranch: "main",
       testCommand: 'node -e "console.log(\'tests ok\')"',
+      setupCommand: 'node -e "console.log(\'setup ok\')"',
     });
     log(`registered ${project.id}`);
 
@@ -193,6 +194,19 @@ async function main() {
     if (!branch.includes(task.branch)) throw new Error("task branch missing");
     if (!existsSync(path.join(repoDir, ".worktrees", task.id, "src", "feature.txt"))) {
       throw new Error("worktree feature file missing");
+    }
+    if (!existsSync(path.join(repoDir, ".worktrees", task.id, ".orc", task.id, "setup.log"))) {
+      throw new Error("worktree setup.log missing");
+    }
+
+    const patchProjectRes = await fetch(`http://127.0.0.1:${port}/api/projects/${project.id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ implModel: "gemini-4-argon-high" }),
+    });
+    const patchProjectData = await patchProjectRes.json();
+    if (!patchProjectRes.ok || patchProjectData.project?.implModel !== "gemini-4-argon-high") {
+      throw new Error("project settings update endpoint failed");
     }
 
     const finalState = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();

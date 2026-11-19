@@ -249,7 +249,8 @@ work, and use Hydrogen or Sonnet for mechanical UI edits.
 
 ## 7. Configuration
 
-`orc.config.json`:
+`orc.config.json` is gitignored so your registered projects stay local (`orc.config.example.json`
+is the tracked template):
 
 ```json
 {
@@ -260,7 +261,11 @@ work, and use Hydrogen or Sonnet for mechanical UI edits.
       "name": "my-app",
       "path": "C:\\Users\\you\\code\\my-app",
       "baseBranch": "main",
-      "testCommand": "npm test"
+      "testCommand": "npm test",
+      "setupCommand": "",
+      "reviewer": "",
+      "implModel": "",
+      "reviewModel": ""
     }
   ]
 }
@@ -269,11 +274,12 @@ work, and use Hydrogen or Sonnet for mechanical UI edits.
 - `data/orc.db` — SQLite (WAL) with tasks, events, runs.
 - `data/logs/` — raw JSONL from each CLI run.
 - `STATUS.md` — generated root summary (gitignored).
-- `<project>/docs/board.md` — generated project board.
+- `<project>/docs/board.md` — generated project board (Obsidian-compatible vault under `<project>/docs/`).
 
 For tests or a second instance, override `ORC_CONFIG` and `ORC_DATA_DIR`. Set
 `ORC_MAX_CONCURRENCY` (or `maxConcurrency` in `orc.config.json`, default `2`) to cap total
-parallel agent runs across projects.
+parallel agent runs across projects, and `ORC_MAX_FILE_BYTES` (default `5242880` = 5 MiB)
+to guard against committing accidental binaries or large telemetry dumps.
 
 The server binds `127.0.0.1` only. There is no authentication. Do not expose the port.
 
@@ -294,6 +300,7 @@ The server binds `127.0.0.1` only. There is no authentication. Do not expose the
 | POST | `/api/tasks/:id/spec` | save spec (Inbox → Ready) |
 | POST | `/api/tasks/:id/open` | open worktree/spec/project |
 | POST | `/api/projects` | register + scaffold project |
+| POST | `/api/projects/:id` | update project settings (branch, test/setup cmds, reviewer, models) |
 | GET | `/api/events` | SSE: `task-event`, `refresh`, `hello` |
 
 SSE is the live channel; the UI also polls every 30 seconds as a safety net.
@@ -312,8 +319,9 @@ src/agents.js       Claude + Antigravity CLI adapters, stream parsing
 src/dispatch.js     state machine, worktrees, prompts, diff, review, tests
 src/server.js       HTTP API, SSE, static UI
 src/open.js         Explorer/file reveal
-public/             dashboard (vanilla JS, no build)
+public/             dashboard (vanilla JS, colorized diffs, rendered markdown)
 templates/          files copied into managed projects
+skills/             reusable Antigravity / Claude Code orchestrator skill
 scripts/check.mjs   syntax + required-file check
 scripts/probe.mjs   real-CLI headless probe (`claude` / `agy`)
 scripts/smoke.mjs   end-to-end fake-CLI + git + HTTP smoke test
@@ -368,19 +376,22 @@ Real-CLI probe findings (`node scripts/probe.mjs` on Windows 11):
   and `result` (`status: "SUCCESS"`, authoritative `response`).
 
 Remaining gaps:
-- Full multi-step `implement → review → verify → merge` runs have been verified with fake
-  CLIs, not yet with real `claude` + `agy` tasks.
 - No remote push or pull-request automation (`orc merge` is local rebase + fast-forward only).
 - No authentication; localhost only.
-- The dashboard shows raw markdown; it does not render it.
 - Review verdicts are parsed from text; a missing verdict blocks the task.
 - Windows-first process killing (`taskkill /T /F`); POSIX uses process groups.
-- Model defaults come from the CLIs unless the environment variables above are set.
+- Scoped `agy` `permissions.allow` rules in `~/.gemini/antigravity-cli/settings.json` are
+  still up to the user if running without `ORC_AGY_YOLO=1`.
 
 ---
 
-## 13. Next steps
+## 13. Architect + Worker workflow (Skill + Obsidian)
 
-1. Run one throwaway task in a scratch git repo end-to-end with real `claude` + `agy` (`run` → `done` → `merge`) and verify scoped `agy` permissions in `--mode accept-edits`.
-2. Add model selection to the UI (per project and per role).
-3. Render formatted markdown and colorized diffs in the task drawer.
+Pair an interactive Antigravity or Claude Code session with ORC using
+[skills/orc-orchestrator/SKILL.md](skills/orc-orchestrator/SKILL.md):
+- Copy `skills/orc-orchestrator/SKILL.md` into `~/.gemini/config/skills/orc-orchestrator/`
+  (Antigravity) and/or `~/.claude/skills/orc-orchestrator/` (Claude Code).
+- Open `<project>/docs/` in **Obsidian** as your project brain (`index.md`,
+  `architecture.md`, `decisions/ADR-*.md`, `specs/`, and auto-updated `board.md`).
+- Work with your interactive agent to break down big features into tightly scoped ORC
+  subtasks with isolated worktrees and cross-agent review.

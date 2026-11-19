@@ -23,7 +23,7 @@ process.env.ORC_CONFIG = path.join(tempDir, "orc.config.json");
 process.env.ORC_DATA_DIR = path.join(tempDir, "data");
 
 const { buildArgs, consumeLine, createStreamState, quoteCmd } = await import("../src/agents.js");
-const { addProject } = await import("../src/config.js");
+const { addProject, updateProject } = await import("../src/config.js");
 const { db, isPidAlive, reapDeadRuns } = await import("../src/db.js");
 const { createTask, failTask, getTask, getTaskDetail, saveSpec, setState, updateTask } =
   await import("../src/board.js");
@@ -32,7 +32,9 @@ const {
   checkConcurrency,
   createEventCoalescer,
   effortFor,
+  maxTrackedFileBytes,
   mergeTask,
+  modelFor,
   parseVerdict,
   recoverWorktrees,
   reviewerFor,
@@ -549,5 +551,62 @@ describe("hardening: cmd quoting, PID reaping, event coalescing, reviewer fallba
       }),
       "agy",
     );
+  });
+
+  it("applies per-project model/reviewer overrides and updateProject", () => {
+    const dir = path.join(tempDir, "proj-settings");
+    mkdirSync(dir, { recursive: true });
+    const proj = addProject({ name: "proj-settings", projectPath: dir });
+    const updated = updateProject(proj.id, {
+      setupCommand: "echo setup",
+      reviewer: "same",
+      implModel: "gemini-pro-orchestrator-argon",
+      reviewModel: "gemini-4-argon-high",
+    });
+
+    assert.equal(updated.setupCommand, "echo setup");
+    assert.equal(reviewerFor("agy", { env: {}, project: updated }), "agy");
+    assert.equal(modelFor("agy", "impl", updated), "gemini-pro-orchestrator-argon");
+    assert.equal(modelFor("agy", "review", updated), "gemini-4-argon-high");
+    withEnv({ ORC_AGY_EFFORT: "high" }, () => {
+      assert.equal(effortFor("agy", "impl", updated), null);
+      assert.equal(effortFor("agy", "review", updated), "high");
+    });
+  });
+
+  it("refuses oversized staged files in captureWork and unstages them cleanly", async () => {
+    const bigRepo = path.join(tempDir, "big-file-repo");
+    mkdirSync(bigRepo, { recursive: true });
+    writeFileSync(path.join(bigRepo, "README.md"), "# big file test\n", "utf8");
+    git(bigRepo, ["init", "-b", "main"]);
+    git(bigRepo, ["config", "user.name", "Test User"]);
+    git(bigRepo, ["config", "user.email", "test@example.invalid"]);
+    git(bigRepo, ["add", "-A"]);
+    git(bigRepo, ["commit", "-m", "initial"]);
+
+    const before = git(bigRepo, ["rev-parse", "HEAD"]);
+    writeFileSync(path.join(bigRepo, "dump.bin"), "x".repeat(2048), "utf8");
+
+    const saved = process.env.ORC_MAX_FILE_BYTES;
+    process.env.ORC_MAX_FILE_BYTES = "1024";
+    try {
+      assert.equal(maxTrackedFileBytes(), 1024);
+      await assert.rejects(
+        () =>
+          captureWork(
+            bigRepo,
+            { id: "T-9001", title: "Big dump" },
+            { baseBranch: "main" },
+            "implementation",
+            before,
+          ),
+        /Refused to commit oversized file/,
+      );
+      assert.equal(git(bigRepo, ["rev-parse", "HEAD"]), before);
+      assert.equal(git(bigRepo, ["status", "--porcelain", "--untracked-files=no"]), "");
+    } finally {
+      if (saved === undefined) delete process.env.ORC_MAX_FILE_BYTES;
+      else process.env.ORC_MAX_FILE_BYTES = saved;
+    }
   });
 });

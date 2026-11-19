@@ -7,6 +7,7 @@ import {
   loadConfig,
   PUBLIC_DIR,
   resolveProject,
+  updateProject,
 } from "./config.js";
 import {
   addEvent,
@@ -192,11 +193,25 @@ async function route(req, res, clients) {
       projectPath: body.path,
       baseBranch: body.baseBranch || "main",
       testCommand: body.testCommand || "",
+      setupCommand: body.setupCommand || "",
+      reviewer: body.reviewer || "",
+      implModel: body.implModel || "",
+      reviewModel: body.reviewModel || "",
     });
     const init = initProject(project);
     syncAll();
     bus.emit("refresh");
     sendJson(res, { project, init }, 201);
+    return;
+  }
+
+  const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
+  if (projectMatch && (method === "POST" || method === "PATCH")) {
+    const body = await readJsonBody(req);
+    const project = updateProject(projectMatch[1], body);
+    syncAll();
+    bus.emit("refresh");
+    sendJson(res, { project });
     return;
   }
 

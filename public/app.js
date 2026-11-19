@@ -34,7 +34,18 @@ const ui = {
   tab: "spec",
   specDraft: null,
   specDirty: false,
+  specPreview: false,
+  reviewRaw: false,
+  diffRaw: false,
 };
+
+const MODEL_SUGGESTIONS = [
+  "gemini-pro-orchestrator-argon",
+  "gemini-4-argon-high",
+  "gemini-4-hydrogen-xhigh",
+  "claude-sonnet-5-5",
+  "claude-opus-5-5",
+];
 
 let stateTimer = null;
 let detailTimer = null;
@@ -275,9 +286,20 @@ function renderHero() {
   const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
 
   $("#viewTitle").textContent = project ? project.name : "All projects";
-  $("#viewSub").textContent = project
-    ? `${project.path} · base ${project.baseBranch}${project.testCommand ? ` · test "${project.testCommand}"` : " · no test command"}`
-    : `${(ui.data?.projects ?? []).length} project(s) · ${total} task(s) · one local board`;
+  if (project) {
+    const bits = [
+      project.path,
+      `base ${project.baseBranch}`,
+      project.testCommand ? `test "${project.testCommand}"` : "no test command",
+    ];
+    if (project.setupCommand) bits.push(`setup "${project.setupCommand}"`);
+    if (project.reviewer) bits.push(`reviewer ${project.reviewer}`);
+    if (project.implModel) bits.push(`impl ${project.implModel}`);
+    if (project.reviewModel) bits.push(`review ${project.reviewModel}`);
+    $("#viewSub").innerHTML = `${esc(bits.join(" · "))} <button class="btn small ghost inline-btn" data-action="edit-project">⚙ Settings</button>`;
+  } else {
+    $("#viewSub").textContent = `${(ui.data?.projects ?? []).length} project(s) · ${total} task(s) · one local board`;
+  }
 
   $("#stats").innerHTML = [
     ["Active", active, "blue"],
@@ -464,6 +486,160 @@ function renderDrawer() {
   renderDrawerBody();
 }
 
+function formatInlineMd(escaped) {
+  let out = escaped;
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
+  return out;
+}
+
+function renderMarkdown(source) {
+  const lines = String(source ?? "").replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let inCode = false;
+  let codeLines = [];
+  let inList = false;
+
+  const closeList = () => {
+    if (inList) {
+      out.push("</ul>");
+      inList = false;
+    }
+  };
+
+  for (const raw of lines) {
+    if (/^\s*```/.test(raw)) {
+      closeList();
+      if (!inCode) {
+        inCode = true;
+        codeLines = [];
+      } else {
+        out.push(`<pre class="code md-code">${esc(codeLines.join("\n"))}</pre>`);
+        inCode = false;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeLines.push(raw);
+      continue;
+    }
+
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      closeList();
+      continue;
+    }
+
+    if (/^[*`\s]*VERDICT:\s*(APPROVE|REQUEST\s+CHANGES)\b[*`\s.]*$/i.test(trimmed)) {
+      closeList();
+      const approve = /APPROVE/i.test(trimmed);
+      out.push(
+        `<div class="verdict-pill ${approve ? "approve" : "changes"}">${esc(
+          approve ? "VERDICT: APPROVE" : "VERDICT: REQUEST CHANGES",
+        )}</div>`,
+      );
+      continue;
+    }
+
+    if (/^---+$/.test(trimmed)) {
+      closeList();
+      out.push("<hr />");
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      closeList();
+      const level = heading[1].length;
+      out.push(`<h${level}>${formatInlineMd(esc(heading[2]))}</h${level}>`);
+      continue;
+    }
+
+    const quote = trimmed.match(/^>\s?(.*)$/);
+    if (quote) {
+      closeList();
+      out.push(`<blockquote>${formatInlineMd(esc(quote[1]))}</blockquote>`);
+      continue;
+    }
+
+    const checkItem = trimmed.match(/^[-*]\s+\[([ xX])\]\s+(.*)$/);
+    if (checkItem) {
+      if (!inList) {
+        out.push('<ul class="md-list">');
+        inList = true;
+      }
+      const checked = checkItem[1].toLowerCase() === "x";
+      out.push(
+        `<li class="md-check ${checked ? "done" : ""}"><span>${checked ? "☑" : "☐"}</span> ${formatInlineMd(
+          esc(checkItem[2]),
+        )}</li>`,
+      );
+      continue;
+    }
+
+    const listItem = trimmed.match(/^[-*]\s+(.*)$/);
+    if (listItem) {
+      if (!inList) {
+        out.push('<ul class="md-list">');
+        inList = true;
+      }
+      out.push(`<li>${formatInlineMd(esc(listItem[1]))}</li>`);
+      continue;
+    }
+
+    closeList();
+    out.push(`<p>${formatInlineMd(esc(trimmed))}</p>`);
+  }
+
+  if (inCode) {
+    out.push(`<pre class="code md-code">${esc(codeLines.join("\n"))}</pre>`);
+  }
+  closeList();
+  return `<div class="md-view">${out.join("\n")}</div>`;
+}
+
+function renderDiff(patch) {
+  const lines = String(patch ?? "").replace(/\r\n/g, "\n").split("\n");
+  let files = 0;
+  let added = 0;
+  let removed = 0;
+
+  const rows = lines.map((line) => {
+    if (line.startsWith("diff --git ")) {
+      files += 1;
+      return `<div class="diff-line diff-file">${esc(line)}</div>`;
+    }
+    if (line.startsWith("@@ ")) {
+      return `<div class="diff-line diff-hunk">${esc(line)}</div>`;
+    }
+    if (
+      line.startsWith("index ") ||
+      line.startsWith("--- ") ||
+      line.startsWith("+++ ") ||
+      line.startsWith("new file ") ||
+      line.startsWith("deleted file ")
+    ) {
+      return `<div class="diff-line diff-meta">${esc(line)}</div>`;
+    }
+    if (line.startsWith("+")) {
+      added += 1;
+      return `<div class="diff-line diff-add">${esc(line)}</div>`;
+    }
+    if (line.startsWith("-")) {
+      removed += 1;
+      return `<div class="diff-line diff-del">${esc(line)}</div>`;
+    }
+    return `<div class="diff-line diff-ctx">${esc(line || " ")}</div>`;
+  });
+
+  return {
+    summary: `${files} file(s) · +${added} -${removed}`,
+    html: `<div class="diff-view">${rows.join("")}</div>`,
+  };
+}
+
 function renderDrawerBody() {
   const body = document.querySelector(".drawer-body");
   if (!body) return;
@@ -482,25 +658,55 @@ function renderDrawerBody() {
       <div class="code-head">
         <span class="mono">${esc(task.spec_path ?? "")}</span>
         <span class="spacer"></span>
+        <button class="btn small ghost" data-action="toggle-spec-preview">${
+          ui.specPreview ? "Edit" : "Preview"
+        }</button>
         <button class="btn small" data-action="save-spec" ${ui.specDirty ? "" : "disabled"}>Save spec</button>
       </div>
-      <textarea id="specEditor" class="spec-editor" spellcheck="false"
-        aria-label="Task spec markdown">${esc(value)}</textarea>
+      ${
+        ui.specPreview
+          ? renderMarkdown(value)
+          : `<textarea id="specEditor" class="spec-editor" spellcheck="false"
+              aria-label="Task spec markdown">${esc(value)}</textarea>`
+      }
       <p class="hint">The spec is the handoff. Saving a spec on an Inbox task moves it to Ready. Keep it short, concrete, and current.</p>`;
     return;
   }
 
   if (ui.tab === "review") {
-    body.innerHTML = detail.review
-      ? `<pre class="code">${esc(detail.review)}</pre>`
-      : '<div class="empty-panel">No review yet. Run the task and the reviewer will write a verdict here.</div>';
+    if (!detail.review) {
+      body.innerHTML =
+        '<div class="empty-panel">No review yet. Run the task and the reviewer will write a verdict here.</div>';
+      return;
+    }
+    body.innerHTML = `
+      <div class="code-head">
+        <span class="mono">review.md</span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" data-action="toggle-review-raw">${
+          ui.reviewRaw ? "Rendered" : "Raw"
+        }</button>
+      </div>
+      ${ui.reviewRaw ? `<pre class="code">${esc(detail.review)}</pre>` : renderMarkdown(detail.review)}`;
     return;
   }
 
   if (ui.tab === "diff") {
-    body.innerHTML = detail.diff
-      ? `<pre class="code">${esc(detail.diff)}</pre>`
-      : '<div class="empty-panel">No diff captured yet. It appears after the implementation step.</div>';
+    if (!detail.diff) {
+      body.innerHTML =
+        '<div class="empty-panel">No diff captured yet. It appears after the implementation step.</div>';
+      return;
+    }
+    const rendered = renderDiff(detail.diff);
+    body.innerHTML = `
+      <div class="code-head">
+        <span class="mono">${esc(rendered.summary)}</span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" data-action="toggle-diff-raw">${
+          ui.diffRaw ? "Colorized" : "Raw"
+        }</button>
+      </div>
+      ${ui.diffRaw ? `<pre class="code">${esc(detail.diff)}</pre>` : rendered.html}`;
     return;
   }
 
@@ -604,6 +810,30 @@ async function handleAction(action, element) {
 
     if (action === "new-project") {
       openProjectModal();
+      return;
+    }
+
+    if (action === "edit-project") {
+      const project = currentProject();
+      if (project) openProjectSettingsModal(project);
+      return;
+    }
+
+    if (action === "toggle-spec-preview") {
+      ui.specPreview = !ui.specPreview;
+      renderDrawerBody();
+      return;
+    }
+
+    if (action === "toggle-review-raw") {
+      ui.reviewRaw = !ui.reviewRaw;
+      renderDrawerBody();
+      return;
+    }
+
+    if (action === "toggle-diff-raw") {
+      ui.diffRaw = !ui.diffRaw;
+      renderDrawerBody();
       return;
     }
 
@@ -794,6 +1024,26 @@ function openTaskModal() {
   setTimeout(() => document.querySelector('#taskForm input[name="title"]')?.focus(), 0);
 }
 
+function modelDatalistHtml() {
+  return `<datalist id="orcModels">${MODEL_SUGGESTIONS.map((m) => `<option value="${esc(m)}"></option>`).join("")}</datalist>`;
+}
+
+function reviewerOptionsHtml(selected = "") {
+  const opts = [
+    ["", "Default (opposite CLI / ORC_REVIEWER)"],
+    ["auto", "Auto (opposite CLI, fallback to same)"],
+    ["same", "Same CLI (fresh plan session)"],
+    ["claude", "Always Claude Code"],
+    ["agy", "Always Google Antigravity"],
+  ];
+  return opts
+    .map(
+      ([value, label]) =>
+        `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(label)}</option>`,
+    )
+    .join("");
+}
+
 function openProjectModal() {
   $("#modalRoot").innerHTML = `
     <div class="modal-backdrop">
@@ -814,14 +1064,35 @@ function openProjectModal() {
             <span>Display name</span>
             <input name="name" placeholder="my-app" />
           </label>
-          <label class="field">
-            <span>Base branch</span>
-            <input name="baseBranch" value="main" />
-          </label>
+          <div class="field-row">
+            <label class="field">
+              <span>Base branch</span>
+              <input name="baseBranch" value="main" />
+            </label>
+            <label class="field">
+              <span>Reviewer policy</span>
+              <select name="reviewer">${reviewerOptionsHtml("")}</select>
+            </label>
+          </div>
           <label class="field">
             <span>Test command</span>
             <input name="testCommand" placeholder="npm test" />
           </label>
+          <label class="field">
+            <span>Worktree setup command (optional)</span>
+            <input name="setupCommand" placeholder="git submodule update --init" />
+          </label>
+          <div class="field-row">
+            <label class="field">
+              <span>Implementer model (optional)</span>
+              <input name="implModel" list="orcModels" placeholder="CLI / env default" />
+            </label>
+            <label class="field">
+              <span>Reviewer model (optional)</span>
+              <input name="reviewModel" list="orcModels" placeholder="CLI / env default" />
+            </label>
+          </div>
+          ${modelDatalistHtml()}
           <p class="hint">ORC writes AGENTS.md, docs/index.md, docs/specs/, docs/decisions/, and a .gitignore entry for .worktrees/. Existing files are left alone.</p>
           <div class="modal-actions">
             <button type="button" class="btn" data-close-modal>Cancel</button>
@@ -831,6 +1102,61 @@ function openProjectModal() {
       </div>
     </div>`;
   setTimeout(() => document.querySelector('#projectForm input[name="path"]')?.focus(), 0);
+}
+
+function openProjectSettingsModal(project) {
+  $("#modalRoot").innerHTML = `
+    <div class="modal-backdrop">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="projectSettingsTitle">
+        <header class="modal-head">
+          <div>
+            <h2 id="projectSettingsTitle">Project settings · ${esc(project.name)}</h2>
+            <p class="mono">${esc(project.path)}</p>
+          </div>
+          <button class="drawer-close" data-close-modal aria-label="Close">×</button>
+        </header>
+        <form id="projectSettingsForm" data-project-id="${esc(project.id)}">
+          <div class="field-row">
+            <label class="field">
+              <span>Display name</span>
+              <input name="name" value="${esc(project.name)}" required />
+            </label>
+            <label class="field">
+              <span>Base branch</span>
+              <input name="baseBranch" value="${esc(project.baseBranch || "main")}" required />
+            </label>
+          </div>
+          <label class="field">
+            <span>Test command</span>
+            <input name="testCommand" value="${esc(project.testCommand || "")}" placeholder="npm test" />
+          </label>
+          <label class="field">
+            <span>Worktree setup command (runs on new worktree)</span>
+            <input name="setupCommand" value="${esc(project.setupCommand || "")}" placeholder="git submodule update --init" />
+          </label>
+          <label class="field">
+            <span>Reviewer policy</span>
+            <select name="reviewer">${reviewerOptionsHtml(project.reviewer || "")}</select>
+          </label>
+          <div class="field-row">
+            <label class="field">
+              <span>Implementer model override</span>
+              <input name="implModel" list="orcModels" value="${esc(project.implModel || "")}" placeholder="CLI / env default" />
+            </label>
+            <label class="field">
+              <span>Reviewer model override</span>
+              <input name="reviewModel" list="orcModels" value="${esc(project.reviewModel || "")}" placeholder="CLI / env default" />
+            </label>
+          </div>
+          ${modelDatalistHtml()}
+          <p class="hint">Changes take effect on the next task run without restarting ORC. Leave model overrides blank to use ORC_* environment variables or CLI defaults.</p>
+          <div class="modal-actions">
+            <button type="button" class="btn" data-close-modal>Cancel</button>
+            <button type="submit" class="btn primary">Save settings</button>
+          </div>
+        </form>
+      </div>
+    </div>`;
 }
 
 async function submitTaskForm(form) {
@@ -871,6 +1197,10 @@ async function submitProjectForm(form) {
         name: data.name,
         baseBranch: data.baseBranch,
         testCommand: data.testCommand,
+        setupCommand: data.setupCommand,
+        reviewer: data.reviewer,
+        implModel: data.implModel,
+        reviewModel: data.reviewModel,
       }),
     });
     closeModal();
@@ -878,6 +1208,33 @@ async function submitProjectForm(form) {
     await refreshState();
     toast(`Registered ${result.project.name}`, "ok");
     if (result.init?.warnings?.length) toast(result.init.warnings[0], "error");
+  } catch (error) {
+    toast(error.message, "error");
+    if (button) button.disabled = false;
+  }
+}
+
+async function submitProjectSettingsForm(form) {
+  const projectId = form.dataset.projectId;
+  const data = Object.fromEntries(new FormData(form).entries());
+  const button = form.querySelector('button[type="submit"]');
+  if (button) button.disabled = true;
+  try {
+    const result = await api(`/api/projects/${encodeURIComponent(projectId)}`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: data.name,
+        baseBranch: data.baseBranch,
+        testCommand: data.testCommand,
+        setupCommand: data.setupCommand,
+        reviewer: data.reviewer,
+        implModel: data.implModel,
+        reviewModel: data.reviewModel,
+      }),
+    });
+    closeModal();
+    await refreshState();
+    toast(`Saved settings for ${result.project.name}`, "ok");
   } catch (error) {
     toast(error.message, "error");
     if (button) button.disabled = false;
@@ -1014,6 +1371,9 @@ document.addEventListener("submit", (event) => {
   } else if (event.target.id === "projectForm") {
     event.preventDefault();
     submitProjectForm(event.target);
+  } else if (event.target.id === "projectSettingsForm") {
+    event.preventDefault();
+    submitProjectSettingsForm(event.target);
   }
 });
 

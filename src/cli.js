@@ -13,6 +13,7 @@ import {
   syncAll,
 } from "./board.js";
 import {
+  CONFIG_PATH,
   DATA_DIR,
   ROOT,
   addProject,
@@ -35,6 +36,10 @@ const VALUE_FLAGS = new Set([
   "branch",
   "base",
   "test",
+  "setup",
+  "reviewer",
+  "impl-model",
+  "review-model",
   "port",
   "note",
 ]);
@@ -339,18 +344,27 @@ export async function main(argv) {
           console.log(`  path   : ${project.path}`);
           console.log(`  base   : ${project.baseBranch} · tasks: ${state?.total ?? 0} · blocked: ${state?.blocked ?? 0}`);
           if (project.testCommand) console.log(`  test   : ${project.testCommand}`);
+          if (project.setupCommand) console.log(`  setup  : ${project.setupCommand}`);
+          if (project.reviewer) console.log(`  review : ${project.reviewer}`);
+          if (project.implModel || project.reviewModel) {
+            console.log(`  models : impl=${project.implModel || "default"} · review=${project.reviewModel || "default"}`);
+          }
         }
         return;
       }
 
       if (sub === "add") {
         const target = positional[2] ?? flags.path;
-        if (!target) throw new Error("Usage: node bin/orc.js project add <path> [--name \"...\"] [--base main] [--test \"npm test\"]");
+        if (!target) throw new Error("Usage: node bin/orc.js project add <path> [--name \"...\"] [--base main] [--test \"npm test\"] [--setup \"...\"]");
         const project = addProject({
           name: flags.name,
           projectPath: target,
           baseBranch: flags.base || flags.branch || "main",
           testCommand: flags.test || "",
+          setupCommand: flags.setup || "",
+          reviewer: flags.reviewer || "",
+          implModel: flags["impl-model"] || "",
+          reviewModel: flags["review-model"] || "",
         });
         let init = null;
         if (!flags["no-init"]) init = initProject(project);
@@ -381,7 +395,13 @@ function doctor() {
   console.log("");
   line(true, "node", `${process.version} (node:sqlite available)`);
   line(existsSync(DATA_DIR), "data", DATA_DIR);
-  line(existsSync(path.join(ROOT, "orc.config.json")), "config", `${path.join(ROOT, "orc.config.json")} · port ${config.port}`);
+  line(
+    existsSync(CONFIG_PATH),
+    "config",
+    existsSync(CONFIG_PATH)
+      ? `${CONFIG_PATH} · port ${config.port}`
+      : `${CONFIG_PATH} (defaults until first project is added) · port ${config.port}`,
+  );
 
   const health = detectAgents(true);
   line(

@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { cpSync, existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
 import { agentLabel, detectAgents, killPidTree, killTree, runAgent } from "./agents.js";
@@ -325,7 +325,7 @@ export async function runTask(taskId, { actor = "you" } = {}) {
     taskId,
     actor,
     type: "run.started",
-    text: `Pipeline started · ${agentLabel(task.agent)} implements, ${agentLabel(reviewerFor(task.agent))} reviews`,
+    text: `Pipeline started · ${agentLabel(task.agent)} implements, ${agentLabel(reviewerFor(task.agent, { project }))} reviews`,
   });
   bus.emit("refresh");
 
@@ -379,9 +379,9 @@ export async function runTask(taskId, { actor = "you" } = {}) {
   }
 }
 
-export function reviewerFor(implementer, { env = process.env, health = null } = {}) {
+export function reviewerFor(implementer, { env = process.env, health = null, project = null } = {}) {
   const opposite = implementer === "agy" ? "claude" : "agy";
-  const override = String(env.ORC_REVIEWER ?? "").trim().toLowerCase();
+  const override = String(project?.reviewer || env.ORC_REVIEWER || "").trim().toLowerCase();
   if (override === "claude" || override === "agy") return override;
   if (override === "same") return implementer === "agy" ? "agy" : "claude";
   if (override === "auto") {
@@ -392,7 +392,9 @@ export function reviewerFor(implementer, { env = process.env, health = null } = 
   return opposite;
 }
 
-export function modelFor(agent, role) {
+export function modelFor(agent, role, project = null) {
+  const projectModel = String(role === "review" ? project?.reviewModel ?? "" : project?.implModel ?? "").trim();
+  if (projectModel) return projectModel;
   if (agent === "agy") {
     const specific = role === "review" ? "ORC_AGY_REVIEW_MODEL" : "ORC_AGY_IMPL_MODEL";
     return process.env[specific] || process.env.ORC_AGY_MODEL || null;
@@ -401,12 +403,18 @@ export function modelFor(agent, role) {
   return process.env[specific] || process.env.ORC_CLAUDE_MODEL || null;
 }
 
-export function effortFor(agent, role) {
+export function effortFor(agent, role, project = null) {
   if (agent !== "agy") return null;
-  const model = modelFor(agent, role);
+  const model = modelFor(agent, role, project);
   // Orchestrator uses a fixed configuration and rejects --effort.
   if (model && model.includes("orchestrator")) return null;
   return process.env.ORC_AGY_EFFORT || null;
+}
+
+export function maxTrackedFileBytes() {
+  const envVal = Number(process.env.ORC_MAX_FILE_BYTES);
+  if (Number.isFinite(envVal) && envVal >= 1024) return Math.floor(envVal);
+  return 5 * 1024 * 1024;
 }
 
 export function yoloFor(agent, role) {
@@ -441,7 +449,8 @@ async function provision(task, project) {
   const worktree = task.worktree || path.join(project.path, ".worktrees", task.id);
   const branch = task.branch || `task/${task.id}-${task.slug}`;
 
-  if (!existsSync(worktree)) {
+  const createdWorktree = !existsSync(worktree);
+  if (createdWorktree) {
     const branchCheck = await git(project.path, ["rev-parse", "--verify", `refs/heads/${branch}`], {
       allowFailure: true,
     });
@@ -462,6 +471,36 @@ async function provision(task, project) {
   const artifactsDir = path.join(worktree, ".orc", task.id);
   ensureDir(artifactsDir);
 
+  if (createdWorktree && String(project.setupCommand ?? "").trim()) {
+    const setupCmd = String(project.setupCommand).trim();
+    addEvent({
+      taskId: task.id,
+      actor: "orc",
+      type: "worktree.setup_started",
+      text: setupCmd,
+    });
+    const setupResult = await runShell(setupCmd, {
+      cwd: worktree,
+      timeoutMs: TEST_TIMEOUT_MS,
+    });
+    writeFileSync(
+      path.join(artifactsDir, "setup.log"),
+      [`$ ${setupCmd}`, `cwd: ${worktree}`, `exit: ${setupResult.code}${setupResult.error ? ` (${setupResult.error})` : ""}`, "", setupResult.output, ""].join("\n"),
+      "utf8",
+    );
+    if (setupResult.code !== 0 || setupResult.error) {
+      throw new Error(
+        `Worktree setupCommand failed (exit ${setupResult.code})${setupResult.error ? `: ${setupResult.error}` : ""}\n${tail(setupResult.output, 1200)}`,
+      );
+    }
+    addEvent({
+      taskId: task.id,
+      actor: "orc",
+      type: "worktree.setup_done",
+      text: setupCmd,
+    });
+  }
+
   const sourceSpec = task.spec_path ? readText(task.spec_path, "") : "";
   if (!sourceSpec.trim()) {
     throw new Error(`Spec file is missing or empty: ${task.spec_path ?? "(none)"}`);
@@ -477,7 +516,7 @@ async function provision(task, project) {
         branch,
         baseBranch: base,
         agent: task.agent,
-        reviewer: reviewerFor(task.agent),
+        reviewer: reviewerFor(task.agent, { project }),
         spec: task.spec_path,
         createdAt: task.created_at,
       },
@@ -539,8 +578,8 @@ async function implementStep(task, project, controller) {
       cwd: worktree,
       sessionId,
       mode: implementer === "agy" ? "accept-edits" : null,
-      model: modelFor(implementer, "impl"),
-      effort: effortFor(implementer, "impl"),
+      model: modelFor(implementer, "impl", project),
+      effort: effortFor(implementer, "impl", project),
       yolo: yoloFor(implementer, "impl"),
       timeoutMs: AGENT_TIMEOUT_MS,
       taskId: task.id,
@@ -592,7 +631,7 @@ async function implementStep(task, project, controller) {
   });
 
   setState(task.id, "review", {
-    note: `${agentLabel(implementer)} ${label} complete · ${agentLabel(reviewerFor(implementer))} will review`,
+    note: `${agentLabel(implementer)} ${label} complete · ${agentLabel(reviewerFor(implementer, { project }))} will review`,
     actor: "orc",
   });
 }
@@ -600,7 +639,7 @@ async function implementStep(task, project, controller) {
 async function reviewStep(task, project, controller) {
   if (!task.worktree) throw new Error("Task has no worktree; run the implementation step first.");
   const artifactsDir = path.join(task.worktree, ".orc", task.id);
-  const reviewer = reviewerFor(task.agent);
+  const reviewer = reviewerFor(task.agent, { project });
   const prompt = buildReviewPrompt(task, project);
   writeFileSync(path.join(artifactsDir, "prompt-review.md"), prompt, "utf8");
   const cliPrompt = `Read and follow .orc/${task.id}/prompt-review.md in this worktree.`;
@@ -622,8 +661,8 @@ async function reviewStep(task, project, controller) {
       prompt: cliPrompt,
       cwd: task.worktree,
       mode: "plan",
-      model: modelFor(reviewer, "review"),
-      effort: effortFor(reviewer, "review"),
+      model: modelFor(reviewer, "review", project),
+      effort: effortFor(reviewer, "review", project),
       timeoutMs: AGENT_TIMEOUT_MS,
       taskId: task.id,
       runId,
@@ -859,6 +898,29 @@ export async function captureWork(worktree, task, project, label, before) {
   await git(worktree, ["add", "-A"]);
   if (existsSync(path.join(worktree, ".orc"))) {
     await git(worktree, ["reset", "-q", "--", ".orc"]);
+  }
+
+  // Guard against accidental binaries, build artifacts, or large telemetry dumps.
+  const limitBytes = maxTrackedFileBytes();
+  const stagedNames = await git(worktree, ["diff", "--cached", "--name-only", "--diff-filter=AM", "-z"]);
+  const oversized = [];
+  for (const rel of stagedNames.stdout.split("\0").filter(Boolean)) {
+    const full = path.join(worktree, rel);
+    if (!existsSync(full)) continue;
+    try {
+      const stats = statSync(full);
+      if (stats.isFile() && stats.size > limitBytes) {
+        oversized.push(`${rel} (${(stats.size / (1024 * 1024)).toFixed(2)} MB)`);
+      }
+    } catch {
+      // Ignore vanished temp entries.
+    }
+  }
+  if (oversized.length) {
+    await git(worktree, ["reset", "-q"], { allowFailure: true });
+    throw new Error(
+      `Refused to commit oversized file(s) exceeding ${(limitBytes / (1024 * 1024)).toFixed(1)} MB: ${oversized.join(", ")}. Add them to .gitignore or raise ORC_MAX_FILE_BYTES.`,
+    );
   }
 
   // Only tracked changes count. Untracked artifacts are intentionally ignored.
