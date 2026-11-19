@@ -6,4 +6,6 @@ data/
 .env
 orc.config.json
 STATUS.md
+docs/board.md
+docs/specs/
 

@@ -955,7 +955,7 @@ export function buildReviewPrompt(task, project) {
     "## Check",
     "- Every acceptance criterion is actually met.",
     "- The diff is scoped; no unrelated files, secrets, or generated artifacts.",
-    "- Tests or checks are adequate. You may run read-only commands or the test suite.",
+    `- Tests or checks are adequate. ${hasTestLog ? `Inspect ${artifacts}/test.log; do` : "Do"} not run shell commands (headless review uses file-read tools only).`,
     "- Failure modes, edge cases, and regressions the spec named.",
     "",
     "## Output",

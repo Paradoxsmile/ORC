@@ -738,7 +738,8 @@ describe("pipeline order: verify before review", () => {
 
     const withoutLog = buildReviewPrompt(task, project);
     assert.match(withoutLog, /\.orc\/T-0100\/diff\.patch/);
-    assert.doesNotMatch(withoutLog, /\.orc\/T-0100\/test\.log/);
+    assert.doesNotMatch(withoutLog, /- Test log: \.orc\/T-0100\/test\.log/);
+    assert.match(withoutLog, /do not run shell commands/i);
 
     writeFileSync(path.join(artifacts, "test.log"), "ok\n", "utf8");
     const withLog = buildReviewPrompt(task, project);
