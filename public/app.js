@@ -212,7 +212,7 @@ function renderHealth() {
     ["agy", "Antigravity"],
     ["git", "Git"],
   ];
-  $("#health").innerHTML = items
+  const pills = items
     .map(([key, label]) => {
       const entry = health[key];
       const ok = Boolean(entry?.available);
@@ -220,6 +220,7 @@ function renderHealth() {
       return `<span class="${ok ? "ok" : "off"}" title="${esc(title)}"><i></i>${label}</span>`;
     })
     .join("");
+  $("#health").innerHTML = `<button type="button" class="health-btn" data-action="open-doctor" title="Click for CLI setup & doctor info">${pills}</button>`;
 }
 
 function renderProjects() {
@@ -425,6 +426,17 @@ function renderDrawer() {
   const running = ui.detail ? Boolean(ui.detail.running) : Boolean((ui.data?.running ?? []).includes(task.id));
   const canRun = ["specced", "working", "fixing", "review", "verify"].includes(task.state);
   const loops = Number(task.review_loops ?? 0);
+  const runtime = ui.detail?.runtime;
+  const runtimeLabel = runtime
+    ? `${COMMANDS[runtime.implementer] ?? runtime.implementer} → ${COMMANDS[runtime.reviewer] ?? runtime.reviewer}`
+    : COMMANDS[task.agent] ?? task.agent;
+  const modelNote =
+    runtime && (runtime.implModel !== "default" || runtime.reviewModel !== "default")
+      ? ` (${runtime.implModel} / ${runtime.reviewModel})`
+      : "";
+  const rateLimitEvent = [...(ui.detail?.events ?? [])]
+    .reverse()
+    .find((event) => event.type === "agent.rate_limit");
 
   const actions = running
     ? '<button class="btn danger" data-action="stop">■ Stop</button>'
@@ -441,7 +453,8 @@ function renderDrawer() {
             <span class="state-pill ${esc(task.state)}">${esc(STATE_LABEL[task.state] ?? task.state)}</span>
             <span>${esc(project?.name ?? projectName(task.project_id))}</span>
             <span>·</span>
-            <span>${esc(COMMANDS[task.agent] ?? task.agent)}</span>
+            <span>${esc(runtimeLabel)}${esc(modelNote)}</span>
+            ${runtime?.agyYolo && runtime.implementer === "agy" ? '<span class="state-pill warn-pill">YOLO</span>' : ""}
             ${loops ? `<span>· loop ${loops}/2</span>` : ""}
             ${task.branch ? `<span>· <span class="mono">${esc(task.branch)}</span></span>` : ""}
           </div>
@@ -456,6 +469,7 @@ function renderDrawer() {
         <button class="btn small" data-action="open-spec">Spec file</button>
         <button class="btn small" data-action="mark-done" ${running ? "disabled" : ""}>Mark done</button>
         <button class="btn small" data-action="mark-blocked" ${running ? "disabled" : ""}>Block</button>
+        <button class="btn small danger" data-action="delete-task" ${running ? "disabled" : ""}>Delete</button>
         <span class="spacer"></span>
         <select id="stateSelect" aria-label="Move task to state" ${running ? "disabled" : ""}>
           ${STATES.map(
@@ -468,6 +482,7 @@ function renderDrawer() {
       </div>
 
       ${task.last_error ? `<div class="banner">${esc(task.last_error)}</div>` : ""}
+      ${rateLimitEvent ? `<div class="banner warn">Rate limit notice: ${esc(rateLimitEvent.text)}</div>` : ""}
 
       <nav class="tabs" aria-label="Task views">
         ${["spec", "review", "diff", "tests", "events"]
@@ -813,9 +828,28 @@ async function handleAction(action, element) {
       return;
     }
 
+    if (action === "open-doctor") {
+      openDoctorModal();
+      return;
+    }
+
     if (action === "edit-project") {
       const project = currentProject();
       if (project) openProjectSettingsModal(project);
+      return;
+    }
+
+    if (action === "remove-project") {
+      const projectId = element?.dataset?.projectId;
+      if (!projectId) return;
+      const name = projectName(projectId);
+      if (!window.confirm(`Unregister project "${name}"? Local repository files on disk are not deleted.`)) return;
+      await api(`/api/projects/${encodeURIComponent(projectId)}/remove`, { method: "POST" });
+      closeModal();
+      if (ui.projectId === projectId) ui.projectId = null;
+      if (ui.selectedTaskId) closeDrawer();
+      await refreshState();
+      toast(`Unregistered ${name}`, "ok");
       return;
     }
 
@@ -844,7 +878,7 @@ async function handleAction(action, element) {
       return;
     }
 
-    if (!id && ["run", "stop", "merge", "mark-done", "mark-blocked", "save-spec", "open-worktree", "open-spec"].includes(action)) {
+    if (!id && ["run", "stop", "merge", "delete-task", "mark-done", "mark-blocked", "save-spec", "open-worktree", "open-spec"].includes(action)) {
       return;
     }
 
@@ -872,6 +906,21 @@ async function handleAction(action, element) {
       renderDrawer();
       await refreshState();
       toast(`${id}: merged and cleaned up`, "ok");
+      return;
+    }
+
+    if (action === "delete-task") {
+      const cleanWt = window.confirm(
+        `Delete ${id} from the board? Click OK to also remove its worktree and .orc artifacts (your spec file under docs/specs/ stays intact).`,
+      );
+      if (!cleanWt) return;
+      await api(`/api/tasks/${encodeURIComponent(id)}/delete`, {
+        method: "POST",
+        body: JSON.stringify({ cleanupWorktree: true }),
+      });
+      closeDrawer();
+      await refreshState();
+      toast(`${id}: deleted`, "ok");
       return;
     }
 
@@ -1151,10 +1200,54 @@ function openProjectSettingsModal(project) {
           ${modelDatalistHtml()}
           <p class="hint">Changes take effect on the next task run without restarting ORC. Leave model overrides blank to use ORC_* environment variables or CLI defaults.</p>
           <div class="modal-actions">
+            <button type="button" class="btn danger" data-action="remove-project" data-project-id="${esc(project.id)}">Unregister</button>
+            <span class="spacer"></span>
             <button type="button" class="btn" data-close-modal>Cancel</button>
             <button type="submit" class="btn primary">Save settings</button>
           </div>
         </form>
+      </div>
+    </div>`;
+}
+
+function openDoctorModal() {
+  const health = ui.data?.health ?? {};
+  const rows = [
+    ["Git", health.git, "https://git-scm.com/"],
+    ["Claude Code (claude)", health.claude, "irm https://claude.ai/install.ps1 | iex"],
+    ["Google Antigravity (agy)", health.agy, "irm https://antigravity.google/cli/install.ps1 | iex"],
+  ];
+
+  $("#modalRoot").innerHTML = `
+    <div class="modal-backdrop">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="doctorModalTitle">
+        <header class="modal-head">
+          <div>
+            <h2 id="doctorModalTitle">CLI health &amp; setup</h2>
+            <p>ORC invokes official CLIs headlessly — each vendor keeps its own login and quota.</p>
+          </div>
+          <button class="drawer-close" data-close-modal aria-label="Close">×</button>
+        </header>
+        <div class="modal-body">
+          <div class="doctor-list">
+            ${rows
+              .map(([label, entry, installHint]) => {
+                const ok = Boolean(entry?.available);
+                return `<div class="doctor-row">
+                  <span class="state-pill ${ok ? "done" : "blocked"}">${ok ? "OK" : "MISSING"}</span>
+                  <div>
+                    <strong>${esc(label)}</strong>
+                    <div class="mono">${esc(ok ? entry.path : installHint)}</div>
+                  </div>
+                </div>`;
+              })
+              .join("")}
+          </div>
+          <p class="hint">After installing a CLI, sign in interactively once (<code>claude</code> / <code>agy</code>), install the global launcher (<code>node scripts/install-skill.mjs</code>), then restart <code>orc serve</code>.</p>
+          <div class="modal-actions">
+            <button type="button" class="btn primary" data-close-modal>Close</button>
+          </div>
+        </div>
       </div>
     </div>`;
 }
@@ -1266,6 +1359,7 @@ function connectEvents() {
 
     if (event.type === "run.failed") toast(event.text || "Run failed", "error");
     if (event.type === "run.stopped") toast("Run stopped", "");
+    if (event.type === "agent.rate_limit") toast(`Rate limit: ${event.text}`, "error");
 
     if (ui.selectedTaskId && event.taskId === ui.selectedTaskId && ui.detail) {
       const exists = ui.detail.events.some((item) => item.id === event.id);

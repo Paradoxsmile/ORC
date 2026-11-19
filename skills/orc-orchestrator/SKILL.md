@@ -17,8 +17,9 @@ is critical.
 - **You (this interactive session)** are the **Architect**: read the codebase and Obsidian
   memory (`docs/`), design the architecture, split work into small independent tasks,
   dispatch them to ORC, monitor status, and update memory after tasks merge.
-- **ORC** (`C:\Users\maxvo\Desktop\Projects\ORC\bin\orc.js`) owns specs, isolated git
-  worktrees, implement → review → test loops, and clean rebase merges.
+- **ORC** (`orc` on `PATH`, or `node <path-to-orc>/bin/orc.js`) owns specs, isolated git
+  worktrees, implement → review → test loops, and clean rebase merges. If `orc` is not yet
+  on `PATH`, run `node scripts/install-skill.mjs` inside the ORC repository.
 
 ## Step 1 — Load Project Memory (Obsidian Vault in `docs/`)
 Before breaking down work, read ONLY the relevant memory files in the target repo:
@@ -36,24 +37,24 @@ subtask). For each subtask, write:
   `reviewer` is overridden on the project).
 
 Create each subtask with ORC (never dump huge chat logs into specs):
-```powershell
-node C:\Users\maxvo\Desktop\Projects\ORC\bin\orc.js add <project> "<short title>" `
-  --desc "Scope: <files/module>. Goal: <what changes>. Out of scope: <what not to touch>." `
-  --accept "- [ ] <verifiable requirement 1>" `
-  --accept "- [ ] <unit/sim test covers it>" `
+```sh
+orc add <project> "<short title>" \
+  --desc "Scope: <files/module>. Goal: <what changes>. Out of scope: <what not to touch>." \
+  --accept "- [ ] <verifiable requirement 1>" \
+  --accept "- [ ] <unit/sim test covers it>" \
   --agent agy
 ```
 
 ## Step 3 — Dispatch, Monitor, and Merge
 - Check registered projects and health:
-  `node C:\Users\maxvo\Desktop\Projects\ORC\bin\orc.js doctor`
+  `orc doctor`
 - Check the board:
-  `node C:\Users\maxvo\Desktop\Projects\ORC\bin\orc.js list <project>`
+  `orc list <project>`
 - Run one subtask at a time per project (ORC enforces a per-project lock):
-  `node C:\Users\maxvo\Desktop\Projects\ORC\bin\orc.js run <T-XXXX>`
+  `orc run <T-XXXX>`
 - After reviewing the diff/review in the ORC dashboard (`http://127.0.0.1:4317`), merge
   cleanly onto `baseBranch` (no auto-push):
-  `node C:\Users\maxvo\Desktop\Projects\ORC\bin\orc.js merge <T-XXXX>`
+  `orc merge <T-XXXX>`
 
 ## Step 4 — Update Obsidian Brain Memory
 When a milestone or architectural decision lands:

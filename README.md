@@ -1,397 +1,200 @@
-# ORC — mission control for Claude Code + Google Antigravity
+# ORC — Local Mission Control for Coding Agents
 
-One local board for all your projects: what is ready, what is running, what needs a
-human. ORC is a thin orchestrator over the official CLIs. It never calls a model API,
-never stores OAuth tokens, and never pools quota. Claude keeps its login; Antigravity
-keeps its login.
+[![CI](https://img.shields.io/github/actions/workflow/status/OWNER/ORC/ci.yml?branch=main&label=CI)](../../actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.5-green.svg)](https://nodejs.org/)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](package.json)
 
-> Status: **v0.2**. The board, task/spec model, worktrees, dispatch loop, review loop,
-> local merge cleanup, concurrency locks, worktree recovery, dashboard, offline unit tests,
-> and fake-CLI smoke test are implemented. Both `claude` (`2.1.327`) and `agy` (`1.5.11`)
-> have been probed headlessly with `node scripts/probe.mjs` (all expected flags and
-> `stream-json` envelopes verified). Full multi-step real-CLI task runs are ready to try.
+**ORC** is a local-first orchestrator that gives you **one task board across all your local Git repositories** and drives the official **Claude Code (`claude`)** and **Google Antigravity (`agy`)** CLIs headlessly in isolated Git worktrees.
 
----
+It owns **artifacts and processes** — specs, worktrees, diffs, review verdicts, test logs, and clean local merges — never model APIs or tokens.
 
-## 1. What it is
-
-A local Node.js app with:
-
-- a registry of projects (any local git repo),
-- one SQLite task board across all of them,
-- a spec file per task,
-- one git worktree per task,
-- a dispatch pipeline that runs Claude Code and Antigravity headlessly,
-- a machine-readable review verdict,
-- a test gate before `done`,
-- a local dashboard at `http://127.0.0.1:4317`,
-- generated `docs/board.md` per project and a root `STATUS.md`.
-
-What it is **not**:
-
-- not a chat client,
-- not a proxy for Anthropic or Google APIs,
-- not a shared model session,
-- not a quota pool,
-- not an IDE and not a replacement for Obsidian.
-
-ORC coordinates **work artifacts** (specs, diffs, verdicts, test logs) and **processes**
-(CLI runs, worktrees, stops). That is the whole trick: the two subscriptions never need
-to share a context window.
+> [!IMPORTANT]
+> **Please read the [Disclaimers, Rate Limits & Security](#disclaimers-rate-limits--security) section before running automated agent loops against your subscriptions.**
 
 ---
 
-## 2. The mental model
+## Why ORC?
 
-| Thing | What it is |
-| --- | --- |
-| Project | A local git repository registered once. |
-| Task | A unit of work: `T-0001`, a title, a state, a spec, a branch name. |
-| Spec | The handoff document. The agent reads this, not a giant chat history. |
-| Worktree | `<project>/.worktrees/T-0001`, on branch `task/T-0001-<slug>`. |
-| Run | One CLI process (implement, review, or test) with a log row. |
-| Event | Append-only history shown in the dashboard. |
-| Artifact | Prompt, diff, review, and test log under `<worktree>/.orc/T-0001/`. |
-
-### What `add` means
-
-`add` is **not** a chat message and not a prompt to a model. It creates a unit of work:
-
-1. a row in the task board (`T-0001`),
-2. a spec file in `<project>/docs/specs/YYYY-MM-DD-<slug>.md`,
-3. a branch name (`task/T-0001-<slug>`),
-4. an event in the history.
-
-- Title only → task starts in **Inbox**; write the spec later.
-- With `--desc` or `--accept` → task starts in **Ready** (`specced`) and can run.
-
-Running the task is what creates the worktree and calls a CLI. A task only becomes
-`done` after review and (if configured) tests.
+- **Separate subscriptions, zero API proxying:** `claude` keeps its login and quota; `agy` keeps its login and quota. ORC spawns the official CLIs headlessly and never stores OAuth tokens or proxies vendor traffic.
+- **Focused context per subtask:** Instead of dumping a 100k-token chat history into one session, each task gets a concise spec file (`docs/specs/YYYY-MM-DD-<slug>.md`) and runs in its own isolated Git worktree (`.worktrees/T-0001`).
+- **Cross-agent verification:** One CLI implements (`acceptEdits` / `accept-edits`) and the other reviews in read-only `plan` mode, returning a machine-readable `VERDICT: APPROVE` or `VERDICT: REQUEST CHANGES` (bounded to 2 fix loops) followed by your test gate.
+- **Zero-dependency stack:** Pure Node.js ESM (`>=22.5`, `node:sqlite`), vanilla HTML/CSS/JS dashboard with Server-Sent Events (SSE), no npm packages, no build step.
+- **Obsidian-ready memory:** Every registered repo scaffolds `AGENTS.md`, `docs/index.md`, `docs/architecture.md`, `docs/decisions/`, `docs/specs/`, and an auto-updated `docs/board.md`.
 
 ---
 
-## 3. Quick start
+## Architecture & Pipeline
 
-Requirements:
-
-- Node.js **22.5+** with `node:sqlite` (tested on v26.13.0)
-- git on `PATH`
-- Claude Code CLI (`claude`) and/or Google Antigravity CLI (`agy`)
-
-No `npm install` is required. There are no dependencies.
-
-```powershell
-node bin/orc.js doctor
-
-node bin/orc.js project add C:\Users\you\code\my-app --name my-app --test "npm test"
-# commit the generated scaffold once, so task worktrees inherit AGENTS.md and docs/
-# cd C:\Users\you\code\my-app; git add -A; git commit -m "chore: ORC scaffold"
-
-node bin/orc.js add my-app "Retry failed uploads once" `
-  --desc "A 5xx response currently drops the upload permanently." `
-  --accept "- [ ] retries once on 5xx" `
-  --accept "- [ ] a test covers the retry"
-
-node bin/orc.js run T-0001
-
-node bin/orc.js serve
-# open http://127.0.0.1:4317
+```mermaid
+flowchart LR
+    U["You / Architect Skill"] -->|orc add / UI| S["Spec File\ndocs/specs/*.md"]
+    S -->|Ready| I["Implement Step\nWorktree .worktrees/T-XXXX"]
+    I -->|ORC commits & captures diff| R["Review Step\nRead-only plan mode"]
+    R -->|VERDICT: APPROVE| V["Test Gate\ntestCommand"]
+    R -->|VERDICT: REQUEST CHANGES| F["Fix Loop (max 2)"]
+    F --> I
+    V -->|Pass| D["Done (Worktree ready)"]
+    V -->|Fail (<2 loops)| F
+    D -->|Manual orc merge| M["Rebase + ff-only merge\nArchive .orc/ + Clean worktree"]
+    R & V -->|Limit reached / error| B["Blocked (Human decision)"]
 ```
 
-If PowerShell blocks `npm.ps1`, use the Node entry point directly:
-
-```powershell
-node scripts/check.mjs
-node bin/orc.js serve
-```
+- **One active run per project** (`run.refused` on conflict) and a configurable global cap (`ORC_MAX_CONCURRENCY`, default `2`).
+- **Artifacts preserved after merge:** Before `orc merge` deletes `.worktrees/T-XXXX`, ORC archives `spec.md`, `diff.patch`, `review.md`, `test.log`, and prompts into gitignored `<project>/.orc/T-XXXX/` so history stays inspectable in the dashboard.
 
 ---
 
-## 4. Commands
+## Quick Start
 
-```
-node bin/orc.js serve [--port 4317]
-node bin/orc.js doctor
-node bin/orc.js project add <path> [--name "..."] [--base main] [--test "npm test"]
-node bin/orc.js project list
-node bin/orc.js init <project|path>
-node bin/orc.js add <project> "<title>" [--desc "..."] [--accept "- ..."] [--agent claude|agy]
-node bin/orc.js list [project]
-node bin/orc.js run <taskId>
-node bin/orc.js stop <taskId>
-node bin/orc.js merge <taskId>
-node bin/orc.js state <taskId> <state>
-node bin/orc.js done <taskId> [--note "..."]
-node bin/orc.js block <taskId> [--note "..."]
-node bin/orc.js status
-node bin/orc.js open [task|project] [--spec] [--project]
-node scripts/check.mjs
-node --test
-node scripts/probe.mjs [--agent claude|agy|all]
-node scripts/smoke.mjs
+### 1. Prerequisites
+- **Node.js 22.5+** (uses built-in `node:sqlite`)
+- **Git** on `PATH`
+- **Claude Code (`claude`)** and/or **Google Antigravity (`agy`)** installed and signed in interactively once:
+  - Claude Code (PowerShell): `irm https://claude.ai/install.ps1 | iex` (or `winget install Anthropic.ClaudeCode`) → run `claude` once to log in.
+  - Antigravity CLI (PowerShell): `irm https://antigravity.google/cli/install.ps1 | iex` → run `agy` once to log in.
+
+### 2. Clone & Install Global Launcher + Skill
+
+```sh
+git clone https://github.com/OWNER/ORC.git
+cd ORC
+node scripts/install-skill.mjs
 ```
 
-`project add` registers the repo and writes the docs scaffold:
+`install-skill.mjs` creates a global `orc` / `orc.cmd` launcher in `~/.local/bin` (so you can run `orc serve`, `orc doctor`, etc. from any folder) and installs the portable `orc-orchestrator` skill for both Antigravity (`~/.gemini/config/skills/`) and Claude Code (`~/.claude/skills/`).
 
-```
-AGENTS.md
-docs/index.md
-docs/architecture.md
-docs/specs/
-docs/decisions/
-docs/reviews/
-docs/_templates/spec.md
-docs/_templates/adr.md
-.gitignore entries for .worktrees/ and .orc/
+Verify everything is detected:
+
+```sh
+orc doctor
+node scripts/probe.mjs
 ```
 
-Existing files are never overwritten.
+### 3. Run Your First Task
+
+```sh
+# 1. Register an existing Git repository (commit the scaffold once so worktrees inherit AGENTS.md & docs/)
+orc project add /path/to/your/repo --name my-app --test "npm test"
+
+# 2. Create a scoped task (starts in Ready because --desc / --accept are provided)
+orc add my-app "Retry failed uploads once" \
+  --desc "A 5xx response drops the upload permanently. Update src/upload.js only." \
+  --accept "- [ ] Retries once on 5xx" \
+  --accept "- [ ] Unit test covers the retry" \
+  --agent agy
+
+# 3. Start the dashboard OR run directly from the CLI
+orc serve          # Dashboard at http://127.0.0.1:4317
+orc run T-0001     # Run implement → review → test loop
+
+# 4. Inspect diff/review in the dashboard, then merge locally when satisfied
+orc merge T-0001
+```
+
+> **Windows PowerShell note:** If PowerShell blocks `npm.ps1`, run Node scripts directly (`node scripts/check.mjs`, `node --test`, `node scripts/smoke.mjs`, or `orc ...` after running `install-skill.mjs`).
 
 ---
 
-## 5. States and pipeline
+## Dashboard Features
 
-```
-inbox ──write spec──> specced
-specced ──implement──> working ──diff──> review
-review ──approve──> verify ──tests pass──> done
-review ──request changes──> fixing ──implement──> review
-verify ──tests fail──> fixing (bounded)
-any failure / too many loops ──> blocked
-```
+Open **`http://127.0.0.1:4317`** after running `orc serve`:
 
-- **One task, one worktree, one active run per project.** Tasks across different
-  projects can run in parallel up to `ORC_MAX_CONCURRENCY` (default `2`). A second
-  concurrent run on the same project or above the global limit is refused with a
-  `run.refused` event.
-- At server startup and during `orc doctor`, ORC scans `.worktrees/` to reattach unlinked
-  worktrees, flag stale in-flight tasks (`worktree.stale`), and report orphaned directories.
-- Claude implements by default; Antigravity reviews. Choose `--agent agy` to swap the
-  implementer (then Claude reviews).
-- Review requires the exact final line `VERDICT: APPROVE` or
-  `VERDICT: REQUEST CHANGES`.
-- Maximum **2 review/fix loops**, then the task is blocked for a human.
-- The implementation agent is told not to commit. ORC commits as a local `ORC`
-  identity, captures `git diff <base>...HEAD`, and saves it as `diff.patch`.
-- If the project has a `testCommand`, it runs in the worktree before `done`.
-- Stopping kills the process tree and leaves the task blocked with an event trail.
-- Merging is explicit via `node bin/orc.js merge <taskId>` (or the **Merge** button in
-  the drawer). It refuses if the main worktree is dirty or rebase hits conflicts,
-  archives `.orc/<taskId>/` artifacts into `<project>/.orc/<taskId>/`, fast-forwards
-  `baseBranch`, removes the worktree and task branch, and marks `done`. ORC never pushes
-  or creates PRs.
-
-Artifacts:
-
-```
-<project>/.worktrees/T-0001/.orc/T-0001/
-  spec.md
-  task.json
-  prompt-implement.md
-  prompt-review.md
-  diff.patch
-  review.md
-  test.log
-```
-
-Run logs are also kept in `data/logs/<task>-<run>.jsonl`.
+- **Multi-project Kanban board:** Lanes for `Inbox`, `Ready`, `Working` (implementing/fixing), `Review` (reviewing/verifying), `Blocked`, and `Done`, updated live over SSE.
+- **Task Drawer:**
+  - **Spec tab:** Edit Markdown directly with `Preview` / `Edit` toggle and `Save spec` (moves `Inbox` tasks to `Ready`).
+  - **Review tab:** Rendered Markdown with highlighted green/red `VERDICT` badges (`Rendered` / `Raw` toggle).
+  - **Diff tab:** Colorized unified diff with file count and `+/-` stats (`Colorized` / `Raw` toggle).
+  - **Tests & Events tabs:** Full `test.log`, run history, tool activity, and amber **Rate Limit Notice** banners when `agent.rate_limit` events fire.
+  - **Actions:** `Run`, `Stop`, `Merge`, `Open folder`, `Spec file`, `Mark done`, `Block`, `Delete`, and manual state dropdown.
+- **Project Settings (⚙ Settings):** Edit `baseBranch`, `testCommand`, `setupCommand`, `reviewer` policy (`default`, `auto`, `same`, `claude`, `agy`), `implModel`, and `reviewModel` live without restarting `orc serve`, or unregister the project.
+- **CLI Health Modal:** Click the `Claude · Antigravity · Git` indicators in the top bar to view binary paths and setup commands.
 
 ---
 
-## 6. Models (important)
+## CLI Reference
 
-ORC does **not** choose a model by default; the CLIs use their own defaults. You can pin
-models with environment variables:
-
-| Variable | Used for |
-| --- | --- |
-| `ORC_CLAUDE_MODEL` | default Claude model |
-| `ORC_CLAUDE_IMPL_MODEL` / `ORC_CLAUDE_REVIEW_MODEL` | role-specific Claude model |
-| `ORC_AGY_MODEL` | default Antigravity model |
-| `ORC_AGY_IMPL_MODEL` / `ORC_AGY_REVIEW_MODEL` | role-specific Antigravity model |
-| `ORC_AGY_EFFORT` | `low`, `medium`, `high`, `xhigh`, `max` (ignored for Orchestrator) |
-| `ORC_AGY_YOLO` | `1` to opt into `--dangerously-skip-permissions` on Antigravity implementation (off by default) |
-| `ORC_REVIEWER` | `claude`, `agy`, `same`, or `auto` (falls back to the implementer CLI in a fresh `plan` session when only one CLI is installed) |
-
-Antigravity model slugs come from `agy models`. As of November 2026, relevant ones are:
-
-- `gemini-pro-orchestrator-argon` — **Orchestrator (Argon)**: Gemini 4 Argon plans and
-  reviews, Gemini 4 Hydrogen executes. Available on paid Google AI Pro. Fixed effort.
-- `gemini-4-argon-high` — standalone Gemini 4 Argon, high reasoning. Best for
-  architecture, concurrency, state machines, and strict review.
-- `gemini-4-hydrogen-xhigh` — fast standalone implementation model.
-- `gemini-pro-orchestrator` — Orchestrator (Carbon); Google AI Ultra only.
-- Claude Sonnet 5.5 / Opus 5.5 are also selectable in Antigravity on separate quotas.
-
-Suggested ORC setup for a paid Google AI Pro account:
-
-```powershell
-# Antigravity as reviewer (the default pipeline: Claude implements)
-$env:ORC_AGY_REVIEW_MODEL = "gemini-4-argon-high"
-
-# Antigravity as implementer (task created with --agent agy)
-$env:ORC_AGY_IMPL_MODEL = "gemini-pro-orchestrator-argon"
-```
-
-A task has exactly one implementer and one reviewer. Claude implements and
-Antigravity reviews by default; `--agent agy` swaps the roles. The two roles never
-run on the same CLI.
-
-Pick the reasoning tier in the slug (`-high`, `-xhigh`) and leave `ORC_AGY_EFFORT`
-unset unless the pinned model accepts an override. ORC omits `--effort` for
-Orchestrator slugs because Orchestrator has no thinking-level setting.
-
-For **building ORC itself** in Antigravity, Orchestrator (Argon) is the best default.
-Switch to standalone `gemini-4-argon-high` for the dispatch/state-machine/concurrency
-work, and use Hydrogen or Sonnet for mechanical UI edits.
+| Command | Purpose |
+| :--- | :--- |
+| `orc serve [--port 4317]` | Start the local dashboard and REST/SSE API on `127.0.0.1` |
+| `orc doctor` | Check Node, Git, `claude`, `agy`, registered repos, and stale worktrees |
+| `orc project add <path> [flags]` | Register & scaffold a repo (`--name`, `--base`, `--test`, `--setup`, `--reviewer`, `--impl-model`, `--review-model`) |
+| `orc project list` | List registered projects and task counts |
+| `orc project remove <id\|name>` | Unregister a project from `orc.config.json` (leaves files on disk untouched) |
+| `orc init <project\|path>` | Write `AGENTS.md`, `docs/`, and `.gitignore` scaffold only |
+| `orc add <project> "<title>" [flags]` | Create task (`T-XXXX`), spec file, and branch name (`--desc`, `--accept`, `--agent claude\|agy`) |
+| `orc list [project]` | List tasks across all or one project |
+| `orc run <taskId>` | Run the implement → review → verify pipeline |
+| `orc stop <taskId>` | Stop the active run (works across terminals via SQLite PID) |
+| `orc merge <taskId>` | Rebase task branch onto `baseBranch`, fast-forward, archive `.orc/`, remove worktree & branch, mark `done` |
+| `orc delete <taskId> [--clean]` | Delete task from board (`--clean` also removes its worktree & `.orc/` artifacts) |
+| `orc state <taskId> <state>` | Manually move a task (`inbox\|specced\|working\|review\|fixing\|verify\|done\|blocked`) |
+| `orc done <taskId>` / `orc block <taskId>` | Mark done or blocked with `--note "..."` |
+| `orc status` | Regenerate `STATUS.md` and `docs/board.md` and print board summary |
+| `orc open [task\|project]` | Open worktree, `--spec`, or `--project` in the OS file explorer |
+| `orc install` | Install global `orc` / `orc.cmd` launcher and `orc-orchestrator` skill |
 
 ---
 
-## 7. Configuration
+## Configuration & Environment Variables
 
-`orc.config.json` is gitignored so your registered projects stay local (`orc.config.example.json`
-is the tracked template):
+`orc.config.json` is gitignored so your local project registry stays private (see [orc.config.example.json](orc.config.example.json)). Runtime SQLite data (`data/orc.db`), run logs (`data/logs/`), probe traces (`data/probes/`), and `STATUS.md` are also gitignored.
 
-```json
-{
-  "port": 4317,
-  "projects": [
-    {
-      "id": "my-app",
-      "name": "my-app",
-      "path": "C:\\Users\\you\\code\\my-app",
-      "baseBranch": "main",
-      "testCommand": "npm test",
-      "setupCommand": "",
-      "reviewer": "",
-      "implModel": "",
-      "reviewModel": ""
-    }
-  ]
-}
-```
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `ORC_CONFIG` | `./orc.config.json` | Override path to config file |
+| `ORC_DATA_DIR` | `./data` | Override SQLite & logs directory |
+| `ORC_MAX_CONCURRENCY` | `2` | Global limit of concurrent runs across different projects |
+| `ORC_MAX_FILE_BYTES` | `5242880` (5 MiB) | Block staging/committing oversized files or binaries in `captureWork` |
+| `ORC_REVIEWER` | opposite CLI | `claude`, `agy`, `same`, or `auto` (falls back to implementer if other CLI missing) |
+| `ORC_CLAUDE_MODEL` | CLI default | Default Claude model (`ORC_CLAUDE_IMPL_MODEL` / `ORC_CLAUDE_REVIEW_MODEL` override per role) |
+| `ORC_AGY_MODEL` | CLI default | Default Antigravity model (`ORC_AGY_IMPL_MODEL` / `ORC_AGY_REVIEW_MODEL` override per role) |
+| `ORC_AGY_EFFORT` | unset | Reasoning effort (`low\|medium\|high\|xhigh\|max`; automatically omitted for Orchestrator slugs) |
+| `ORC_AGY_YOLO` | unset (off) | Set to `1` to pass `--dangerously-skip-permissions` to Antigravity implementation runs |
 
-- `data/orc.db` — SQLite (WAL) with tasks, events, runs.
-- `data/logs/` — raw JSONL from each CLI run.
-- `STATUS.md` — generated root summary (gitignored).
-- `<project>/docs/board.md` — generated project board (Obsidian-compatible vault under `<project>/docs/`).
-
-For tests or a second instance, override `ORC_CONFIG` and `ORC_DATA_DIR`. Set
-`ORC_MAX_CONCURRENCY` (or `maxConcurrency` in `orc.config.json`, default `2`) to cap total
-parallel agent runs across projects, and `ORC_MAX_FILE_BYTES` (default `5242880` = 5 MiB)
-to guard against committing accidental binaries or large telemetry dumps.
-
-The server binds `127.0.0.1` only. There is no authentication. Do not expose the port.
+Per-project settings configured in **⚙ Settings** (`implModel`, `reviewModel`, `reviewer`, `setupCommand`, `testCommand`, `baseBranch`) override global env defaults for that project.
 
 ---
 
-## 8. HTTP API
+## Best Practices & Obsidian Integration
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/api/state` | projects, tasks, health, running ids |
-| GET | `/api/tasks/:id` | spec, review, diff, test log, events, runs |
-| POST | `/api/tasks` | create task |
-| POST | `/api/tasks/:id/run` | start pipeline (202, or 409 if locked/at limit) |
-| POST | `/api/tasks/:id/stop` | kill active process |
-| POST | `/api/tasks/:id/merge` | rebase, archive artifacts, remove worktree/branch, mark done |
-| POST | `/api/tasks/:id/state` | manual state move |
-| POST | `/api/tasks/:id/block` | mark blocked with note |
-| POST | `/api/tasks/:id/spec` | save spec (Inbox → Ready) |
-| POST | `/api/tasks/:id/open` | open worktree/spec/project |
-| POST | `/api/projects` | register + scaffold project |
-| POST | `/api/projects/:id` | update project settings (branch, test/setup cmds, reviewer, models) |
-| GET | `/api/events` | SSE: `task-event`, `refresh`, `hello` |
-
-SSE is the live channel; the UI also polls every 30 seconds as a safety net.
+See **[docs/best-practices.md](docs/best-practices.md)** for full workflows on:
+- **Large repositories (e.g., Formula Student, embedded, monorepos):** writing a crisp 1-page `AGENTS.md`, excluding heavy build/telemetry folders, and using `setupCommand` for submodules/venvs.
+- **Architect + Worker pattern:** using [skills/orc-orchestrator/SKILL.md](skills/orc-orchestrator/SKILL.md) inside an interactive Antigravity or Claude Code chat to decompose features into tightly scoped ORC subtasks.
+- **Obsidian brain memory:** opening `<project>/docs/` as an Obsidian vault so `index.md`, `architecture.md`, `decisions/ADR-*.md`, `specs/`, and `board.md` stay synchronized across you and your agents.
 
 ---
 
-## 9. Repository map
+## Testing & Verification
 
-```
-bin/orc.js          entry point
-src/cli.js          commands and doctor
-src/config.js       project registry, config, scaffolding
-src/db.js           node:sqlite schema
-src/board.js        tasks, states, specs, generated board/status
-src/agents.js       Claude + Antigravity CLI adapters, stream parsing
-src/dispatch.js     state machine, worktrees, prompts, diff, review, tests
-src/server.js       HTTP API, SSE, static UI
-src/open.js         Explorer/file reveal
-public/             dashboard (vanilla JS, colorized diffs, rendered markdown)
-templates/          files copied into managed projects
-skills/             reusable Antigravity / Claude Code orchestrator skill
-scripts/check.mjs   syntax + required-file check
-scripts/probe.mjs   real-CLI headless probe (`claude` / `agy`)
-scripts/smoke.mjs   end-to-end fake-CLI + git + HTTP smoke test
-test/               unit tests (`node --test`) and stream fixtures
-docs/decisions/     ADRs for ORC itself
+```sh
+node scripts/check.mjs   # Syntax check all JS, validate JSON, verify required files & privacy
+node --test              # Offline unit tests (verdict, flags, state machine, git capture, merge, concurrency, parsers)
+node scripts/probe.mjs   # Probe installed claude / agy CLIs and save JSONL traces to data/probes/
+node scripts/smoke.mjs   # End-to-end test using fake CLIs, real Git worktrees, merge, and HTTP/SSE API
 ```
 
 ---
 
-## 10. Testing
+## Disclaimers, Rate Limits & Security
 
-```powershell
-node scripts/check.mjs   # syntax + required files
-node --test              # offline unit tests (verdict, states, git, merge, concurrency, parsers)
-node scripts/probe.mjs   # probe real claude/agy CLIs and capture raw JSONL
-node scripts/smoke.mjs   # fake CLIs, real git, real HTTP/SSE plumbing, merge cleanup
-```
+> [!WARNING]
+> **Read carefully before running unattended agent loops:**
 
-The unit suite (`node --test`) runs offline with no network and no vendor CLIs, using
-temporary `ORC_CONFIG` and `ORC_DATA_DIR` paths. `scripts/probe.mjs` skips any missing
-CLI and saves raw JSONL and report files to `data/probes/` when a CLI is installed. The
-smoke test creates a temporary git repo and fake `claude`/`agy` binaries on `PATH`, runs a
-full task through implementation, diff capture, review, tests, `done`, and `merge`, then
-checks the branch, worktree, archived artifacts, probe output, and API. On success it
-prints a temp path that is safe to delete.
-
-## 11. Auth and terms
-- Install Claude Code, run `claude` once, complete login. ORC reuses the cached login.
-- Install Antigravity CLI, run `agy` once, complete login. Headless runs use cached
-  credentials; without them `agy` exits with an authentication error.
-- Each vendor enforces its own quota and terms. ORC does not circumvent either.
-- Antigravity implementation defaults to `--mode accept-edits` **without**
-  `--dangerously-skip-permissions`. Prefer scoped `permissions.allow` rules in
-  `~/.gemini/antigravity-cli/settings.json`. Only set `ORC_AGY_YOLO=1` in trusted
-  repositories if headless tool approval stalls. Remember the worktree limits file scope,
-  not shell scope.
-- Claude headless implements with `--permission-mode acceptEdits` and
-  `--allowedTools "Read,Edit,Write,Bash"`. Reviews run with `--permission-mode plan`
-  and read-only tools (`Read,Grep,Glob,Bash`).
+1. **No Affiliation:** ORC is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Anthropic or Google.
+2. **Terms of Service & Authentication:** ORC executes the official `claude` and `agy` binaries in headless mode. It **never** calls vendor REST APIs directly, **never** stores or proxies OAuth credentials, and **never** pools or shares accounts. You are solely responsible for complying with Anthropic's and Google's terms of service and acceptable use policies.
+3. **Subscription Quotas & Rate Limits:** Each task executes at least one implementation run and one review run, and up to two fix-and-re-review cycles (up to 6 CLI invocations per task). Repeated runs on large codebases can rapidly consume 5-hour or 7-day subscription limits or API credits. Monitor the dashboard (`agent.rate_limit` warnings), write tight specs, use `Stop` whenever a run goes off-track, and check your vendor usage dashboards regularly.
+4. **Headless Permissions & Shell Risk:**
+   - Git worktrees isolate **tracked workspace files**, **not** your operating system, network, or shell environment.
+   - Claude Code runs with `--permission-mode acceptEdits` (`Read,Edit,Write,Bash`) during implementation and `--permission-mode plan` (`Read,Grep,Glob,Bash`) during review.
+   - Antigravity defaults to `--mode accept-edits` **without** `--dangerously-skip-permissions`. Prefer scoped `permissions.allow` rules in `~/.gemini/antigravity-cli/settings.json`; only enable `ORC_AGY_YOLO=1` in repositories and environments you fully trust.
+5. **Localhost-Only Server (`127.0.0.1`):** The HTTP server binds strictly to `127.0.0.1` with **no authentication**. Never forward or expose the port to a network. See [SECURITY.md](SECURITY.md) for the full threat model.
+6. **No Warranty:** Provided "AS IS" under the [MIT License](LICENSE). Always review `diff.patch`, `review.md`, and `test.log` before running `orc merge` — ORC intentionally never pushes or creates PRs automatically.
 
 ---
 
-## 12. Known gaps & real-CLI probe notes
+## Troubleshooting & Contributing
 
-Real-CLI probe findings (`node scripts/probe.mjs` on Windows 11):
-- **Claude Code `2.1.327`**: confirmed `stream-json`, `--permission-mode`, `--allowedTools`,
-  `--resume`, `--model`. Observed events: `system` (`init`, `commands_changed`), `assistant`,
-  `rate_limit_event` (now normalized as `agent.rate_limit`), and `result`.
-- **Google Antigravity `1.5.11`**: confirmed `stream-json`, `--mode`, `--conversation`,
-  `--model`, `--effort`. Observed events: `init` (`permission_mode: "request-review"` in
-  `--mode plan`), `step_update` (`user_input`, `agent_response` with incremental deltas),
-  and `result` (`status: "SUCCESS"`, authoritative `response`).
-
-Remaining gaps:
-- No remote push or pull-request automation (`orc merge` is local rebase + fast-forward only).
-- No authentication; localhost only.
-- Review verdicts are parsed from text; a missing verdict blocks the task.
-- Windows-first process killing (`taskkill /T /F`); POSIX uses process groups.
-- Scoped `agy` `permissions.allow` rules in `~/.gemini/antigravity-cli/settings.json` are
-  still up to the user if running without `ORC_AGY_YOLO=1`.
-
----
-
-## 13. Architect + Worker workflow (Skill + Obsidian)
-
-Pair an interactive Antigravity or Claude Code session with ORC using
-[skills/orc-orchestrator/SKILL.md](skills/orc-orchestrator/SKILL.md):
-- Copy `skills/orc-orchestrator/SKILL.md` into `~/.gemini/config/skills/orc-orchestrator/`
-  (Antigravity) and/or `~/.claude/skills/orc-orchestrator/` (Claude Code).
-- Open `<project>/docs/` in **Obsidian** as your project brain (`index.md`,
-  `architecture.md`, `decisions/ADR-*.md`, `specs/`, and auto-updated `board.md`).
-- Work with your interactive agent to break down big features into tightly scoped ORC
-  subtasks with isolated worktrees and cross-agent review.
+- Stuck on setup, permissions, or Git worktrees? Read **[docs/troubleshooting.md](docs/troubleshooting.md)**.
+- Want to contribute? Read **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[AGENTS.md](AGENTS.md)**.
+- Release history: **[CHANGELOG.md](CHANGELOG.md)**.

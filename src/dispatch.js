@@ -6,13 +6,14 @@ import { agentLabel, detectAgents, killPidTree, killTree, runAgent } from "./age
 import {
   addEvent,
   bus,
+  deleteTask,
   failTask,
   getTask,
   setState,
   syncBoard,
   updateTask,
 } from "./board.js";
-import { ensureProjectGitignore, listProjects, loadConfig, resolveProject } from "./config.js";
+import { ensureProjectGitignore, listProjects, loadConfig, removeProject, resolveProject } from "./config.js";
 import { db, isPidAlive, reapDeadRuns } from "./db.js";
 import { ensureDir, nowIso, readText, truncate } from "./util.js";
 
@@ -292,6 +293,73 @@ export async function mergeTask(taskId, { actor = "you" } = {}) {
   }
 
   return getTask(task.id);
+}
+
+/**
+ * Unregisters a project from orc.config.json after checking no run is active.
+ */
+export function unregisterProject(ref, active = running) {
+  const project = resolveProject(ref);
+  if (!project) throw new Error(`Unknown project: ${ref}`);
+  const activeId = activeTaskForProject(project.id, null, active);
+  if (activeId) {
+    const error = new Error(
+      `Project "${project.name}" has an active run (${activeId}); stop it before removing the project.`,
+    );
+    error.status = 409;
+    throw error;
+  }
+  const removed = removeProject(project.id);
+  bus.emit("refresh");
+  return removed;
+}
+
+/**
+ * Removes a task from the board and optionally deletes its worktree and archived `.orc/` folder.
+ */
+export async function removeTask(taskId, { cleanupWorktree = false, active = running } = {}) {
+  const task = getTask(taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  if (active.has(taskId)) {
+    const error = new Error(`Stop ${taskId} before deleting it`);
+    error.status = 409;
+    throw error;
+  }
+
+  if (cleanupWorktree) {
+    const project = resolveProject(task.project_id);
+    if (task.worktree && existsSync(task.worktree)) {
+      if (project && existsSync(project.path)) {
+        await git(project.path, ["worktree", "remove", "--force", task.worktree], {
+          allowFailure: true,
+        });
+        await git(project.path, ["worktree", "prune"], { allowFailure: true });
+      }
+      if (existsSync(task.worktree)) rmSync(task.worktree, { recursive: true, force: true });
+    }
+    const projectArtifacts = project ? path.join(project.path, ".orc", task.id) : null;
+    if (projectArtifacts && existsSync(projectArtifacts)) {
+      rmSync(projectArtifacts, { recursive: true, force: true });
+    }
+  }
+
+  return deleteTask(taskId);
+}
+
+/**
+ * Computes effective implementer, reviewer, models, and YOLO state for UI display.
+ */
+export function taskRuntimeInfo(task, project = null) {
+  const proj = project ?? resolveProject(task.project_id);
+  const implementer = task.agent === "agy" ? "agy" : "claude";
+  const reviewer = reviewerFor(implementer, { project: proj });
+  return {
+    implementer,
+    reviewer,
+    implModel: modelFor(implementer, "impl", proj) || "default",
+    reviewModel: modelFor(reviewer, "review", proj) || "default",
+    agyYolo: yoloFor("agy", "impl"),
+  };
 }
 
 /**

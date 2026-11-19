@@ -266,6 +266,24 @@ async function main() {
     }
     log("probe script: ok");
 
+    const delRes = await fetch(`http://127.0.0.1:${port}/api/tasks/${task.id}/delete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cleanupWorktree: true }),
+    });
+    if (!delRes.ok) throw new Error(`task delete failed: ${delRes.status}`);
+
+    const remRes = await fetch(`http://127.0.0.1:${port}/api/projects/${project.id}/remove`, {
+      method: "POST",
+    });
+    if (!remRes.ok) throw new Error(`project remove failed: ${remRes.status}`);
+
+    const afterCleanState = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
+    if (afterCleanState.tasks.length !== 0 || afterCleanState.projects.length !== 0) {
+      throw new Error("expected empty tasks and projects after delete/remove");
+    }
+    log("task delete & project remove: ok");
+
     console.log("\nSMOKE PASS");
     console.log(`  task: ${task.id}`);
     console.log(`  branch: ${task.branch}`);

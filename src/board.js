@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { db, nextTaskId } from "./db.js";
+import { db, nextTaskId, tx } from "./db.js";
 import { ROOT, listProjects, resolveProject } from "./config.js";
 import { detectAgents } from "./agents.js";
 import {
@@ -156,6 +156,23 @@ export function failTask(id, message) {
   const text = truncate(message || "Unknown failure", 1000);
   updateTask(id, { last_error: text });
   return setState(id, "blocked", { note: truncate(text, 500), actor: "orc" });
+}
+
+/**
+ * Deletes a task and its events/runs from SQLite and refreshes board summaries.
+ */
+export function deleteTask(id) {
+  const task = getTask(id);
+  if (!task) throw new Error(`Unknown task: ${id}`);
+  tx(() => {
+    db.prepare("DELETE FROM events WHERE task_id = ?").run(id);
+    db.prepare("DELETE FROM runs WHERE task_id = ?").run(id);
+    db.prepare("DELETE FROM tasks WHERE id = ?").run(id);
+  });
+  syncBoard(task.project_id);
+  syncStatus();
+  bus.emit("refresh");
+  return task;
 }
 
 export function getState() {

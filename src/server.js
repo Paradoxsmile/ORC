@@ -25,9 +25,12 @@ import {
   checkConcurrency,
   mergeTask,
   recoverWorktrees,
+  removeTask,
   runningTaskIds,
   runTask,
   stopTask,
+  taskRuntimeInfo,
+  unregisterProject,
 } from "./dispatch.js";
 import { openTarget, revealFile } from "./open.js";
 import { nowIso, truncate } from "./util.js";
@@ -205,14 +208,26 @@ async function route(req, res, clients) {
     return;
   }
 
-  const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)$/);
-  if (projectMatch && (method === "POST" || method === "PATCH")) {
-    const body = await readJsonBody(req);
-    const project = updateProject(projectMatch[1], body);
-    syncAll();
-    bus.emit("refresh");
-    sendJson(res, { project });
-    return;
+  const projectMatch = pathname.match(/^\/api\/projects\/([^/]+)(?:\/([a-z]+))?$/);
+  if (projectMatch) {
+    const projectId = projectMatch[1];
+    const action = projectMatch[2] ?? null;
+
+    if (!action && (method === "POST" || method === "PATCH")) {
+      const body = await readJsonBody(req);
+      const project = updateProject(projectId, body);
+      syncAll();
+      bus.emit("refresh");
+      sendJson(res, { project });
+      return;
+    }
+
+    if ((!action && method === "DELETE") || (action === "remove" && method === "POST")) {
+      const removed = unregisterProject(projectId);
+      syncAll();
+      sendJson(res, { ok: true, removed });
+      return;
+    }
   }
 
   const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/([a-z]+))?$/);
@@ -222,7 +237,18 @@ async function route(req, res, clients) {
 
     if (!action && method === "GET") {
       const detail = getTaskDetail(taskId);
-      sendJson(res, { ...detail, running: runningTaskIds().includes(taskId) });
+      sendJson(res, {
+        ...detail,
+        runtime: taskRuntimeInfo(detail.task, detail.project),
+        running: runningTaskIds().includes(taskId),
+      });
+      return;
+    }
+
+    if ((!action && method === "DELETE") || (action === "delete" && method === "POST")) {
+      const body = method === "POST" ? await readJsonBody(req) : {};
+      const deleted = await removeTask(taskId, { cleanupWorktree: body.cleanupWorktree !== false });
+      sendJson(res, { ok: true, deleted });
       return;
     }
 

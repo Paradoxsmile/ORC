@@ -121,6 +121,18 @@ function normalizeReviewer(value) {
   return ["", "claude", "agy", "same", "auto"].includes(clean) ? clean : "";
 }
 
+export function removeProject(ref) {
+  const config = loadConfig();
+  const needle = String(ref ?? "").toLowerCase();
+  const index = config.projects.findIndex(
+    (item) => item.id.toLowerCase() === needle || item.name.toLowerCase() === needle,
+  );
+  if (index === -1) throw new Error(`Unknown project: ${ref}`);
+  const [removed] = config.projects.splice(index, 1);
+  saveConfig(config);
+  return removed;
+}
+
 export function initProject(project) {
   const created = [];
   const warnings = [];

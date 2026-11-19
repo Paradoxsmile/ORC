@@ -37,9 +37,13 @@ const {
   modelFor,
   parseVerdict,
   recoverWorktrees,
+  removeTask,
   reviewerFor,
+  taskRuntimeInfo,
+  unregisterProject,
   yoloFor,
 } = await import("../src/dispatch.js");
+const { installOrc } = await import("../scripts/install-skill.mjs");
 
 function git(cwd, args) {
   return execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true }).trim();
@@ -608,5 +612,55 @@ describe("hardening: cmd quoting, PID reaping, event coalescing, reviewer fallba
       if (saved === undefined) delete process.env.ORC_MAX_FILE_BYTES;
       else process.env.ORC_MAX_FILE_BYTES = saved;
     }
+  });
+
+  it("deletes tasks with worktree/artifact cleanup, unregisters projects with lock checks, and computes runtime info", async () => {
+    const dir = path.join(tempDir, "cleanup-repo");
+    mkdirSync(dir, { recursive: true });
+    const proj = addProject({
+      name: "cleanup-repo",
+      projectPath: dir,
+      reviewer: "same",
+      implModel: "gemini-pro-orchestrator-argon",
+      reviewModel: "gemini-4-argon-high",
+    });
+
+    const t = createTask({ projectId: proj.id, title: "Clean me", description: "temp task", agent: "agy" });
+    const info = taskRuntimeInfo(t, proj);
+    assert.equal(info.implementer, "agy");
+    assert.equal(info.reviewer, "agy");
+    assert.equal(info.implModel, "gemini-pro-orchestrator-argon");
+    assert.equal(info.reviewModel, "gemini-4-argon-high");
+
+    const fakeWt = path.join(dir, ".worktrees", t.id);
+    const fakeArchive = path.join(dir, ".orc", t.id);
+    mkdirSync(fakeWt, { recursive: true });
+    mkdirSync(fakeArchive, { recursive: true });
+    writeFileSync(path.join(fakeArchive, "review.md"), "ok\n", "utf8");
+    const updatedTask = updateTask(t.id, { worktree: fakeWt });
+
+    const active = new Map([[updatedTask.id, { taskId: updatedTask.id, projectId: proj.id }]]);
+    await assert.rejects(() => removeTask(updatedTask.id, { cleanupWorktree: true, active }), /Stop/);
+    assert.throws(() => unregisterProject(proj.id, active), /active run/);
+
+    await removeTask(updatedTask.id, { cleanupWorktree: true });
+    assert.equal(getTask(updatedTask.id), null);
+    assert.equal(existsSync(fakeWt), false);
+    assert.equal(existsSync(fakeArchive), false);
+
+    const removedProj = unregisterProject(proj.id);
+    assert.equal(removedProj.id, proj.id);
+    assert.throws(() => unregisterProject(proj.id), /Unknown project/);
+  });
+
+  it("installs portable skills and global orc launchers into a custom home directory", () => {
+    const fakeHome = path.join(tempDir, "fake-home");
+    const res = installOrc({ homeDir: fakeHome });
+    assert.ok(existsSync(res.agySkill));
+    assert.ok(existsSync(res.claudeSkill));
+    assert.ok(existsSync(res.cmdPath));
+    assert.ok(existsSync(res.shPath));
+    assert.match(readFileSync(res.cmdPath, "utf8"), /bin\\orc\.js/);
+    assert.match(readFileSync(res.shPath, "utf8"), /bin\/orc\.js/);
   });
 });

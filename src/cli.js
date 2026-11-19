@@ -22,7 +22,15 @@ import {
   loadConfig,
   resolveProject,
 } from "./config.js";
-import { mergeTask, recoverWorktrees, runningTaskIds, runTask, stopTask } from "./dispatch.js";
+import {
+  mergeTask,
+  recoverWorktrees,
+  removeTask,
+  runningTaskIds,
+  runTask,
+  stopTask,
+  unregisterProject,
+} from "./dispatch.js";
 import { openTarget, revealFile } from "./open.js";
 import { truncate } from "./util.js";
 
@@ -194,6 +202,22 @@ export async function main(argv) {
       console.log(`Merged ${task.id} → ${task.state}`);
       console.log(`  branch  : ${task.branch} (removed)`);
       console.log(`  worktree: cleaned up`);
+      return;
+    }
+
+    case "delete": {
+      const id = positional[1];
+      if (!id) throw new Error("Usage: node bin/orc.js delete <taskId> [--clean]");
+      const deleted = await removeTask(id, { cleanupWorktree: Boolean(flags.clean) });
+      console.log(`Deleted ${deleted.id} (${deleted.title})`);
+      return;
+    }
+
+    case "install":
+    case "install-skill": {
+      const { installOrc, printInstallResult } = await import("../scripts/install-skill.mjs");
+      const result = installOrc();
+      printInstallResult(result);
       return;
     }
 
@@ -380,7 +404,16 @@ export async function main(argv) {
         return;
       }
 
-      throw new Error(`Unknown project command "${sub}". Use: project add|list`);
+      if (sub === "remove" || sub === "rm") {
+        const ref = positional[2];
+        if (!ref) throw new Error("Usage: node bin/orc.js project remove <projectId|name>");
+        const removed = unregisterProject(ref);
+        syncAll();
+        console.log(`Unregistered ${removed.name} (${removed.id})`);
+        return;
+      }
+
+      throw new Error(`Unknown project command "${sub}". Use: project add|list|remove`);
     }
 
     default:
@@ -525,6 +558,7 @@ ORC — local mission control for Claude Code and Google Antigravity
   node bin/orc.js doctor                   check CLIs, git, and projects
   node bin/orc.js project add <path>       register + scaffold a project
   node bin/orc.js project list             list registered projects
+  node bin/orc.js project remove <id>      unregister a project
   node bin/orc.js init <project|path>      write docs/AGENTS scaffolding only
   node bin/orc.js add <project> "<title>"  create a task + spec + branch name
         [--desc "..."] [--accept "- ..."] [--agent claude|agy]
@@ -532,11 +566,13 @@ ORC — local mission control for Claude Code and Google Antigravity
   node bin/orc.js run <taskId>             drive implementation → review → verify
   node bin/orc.js stop <taskId>            stop the active agent process
   node bin/orc.js merge <taskId>           rebase onto base, clean worktree, mark done
+  node bin/orc.js delete <taskId> [--clean] remove task from board (--clean removes worktree)
   node bin/orc.js state <taskId> <state>   move a task manually
   node bin/orc.js done <taskId>            mark done
   node bin/orc.js block <taskId>           mark blocked (needs a human)
   node bin/orc.js status                   regenerate + print the board
   node bin/orc.js open [task|project]      open in Explorer (--spec, --project)
+  node bin/orc.js install                  install global orc launcher + agent skill
 
 What "add" creates
   A task row (T-0001), a spec file under docs/specs/, and a branch name.
