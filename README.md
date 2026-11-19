@@ -1,6 +1,6 @@
 # ORC — Local Mission Control for Coding Agents
 
-[![CI](https://img.shields.io/github/actions/workflow/status/OWNER/ORC/ci.yml?branch=main&label=CI)](../../actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/paradoxsmile/ORC/ci.yml?branch=main&label=CI)](https://github.com/paradoxsmile/ORC/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.5-green.svg)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](package.json)
@@ -57,7 +57,7 @@ flowchart LR
 ### 2. Clone & Install Global Launcher + Skill
 
 ```sh
-git clone https://github.com/OWNER/ORC.git
+git clone https://github.com/paradoxsmile/ORC.git
 cd ORC
 node scripts/install-skill.mjs
 ```

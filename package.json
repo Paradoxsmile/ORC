@@ -1,9 +1,18 @@
 {
   "name": "orc",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "description": "Local mission control for Claude Code and Google Antigravity",
+  "homepage": "https://github.com/paradoxsmile/ORC#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/paradoxsmile/ORC.git"
+  },
+  "bugs": {
+    "url": "https://github.com/paradoxsmile/ORC/issues"
+  },
   "bin": {
     "orc": "bin/orc.js"
   },
