@@ -660,7 +660,7 @@ describe("hardening: cmd quoting, PID reaping, event coalescing, reviewer fallba
     assert.ok(existsSync(res.claudeSkill));
     assert.ok(existsSync(res.cmdPath));
     assert.ok(existsSync(res.shPath));
-    assert.match(readFileSync(res.cmdPath, "utf8"), /bin\\orc\.js/);
+    assert.match(readFileSync(res.cmdPath, "utf8"), /bin[/\\]orc\.js/);
     assert.match(readFileSync(res.shPath, "utf8"), /bin\/orc\.js/);
   });
 });

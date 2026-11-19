@@ -28,16 +28,16 @@ It owns **artifacts and processes** — specs, worktrees, diffs, review verdicts
 
 ```mermaid
 flowchart LR
-    U["You / Architect Skill"] -->|orc add / UI| S["Spec File\ndocs/specs/*.md"]
-    S -->|Ready| I["Implement Step\nWorktree .worktrees/T-XXXX"]
-    I -->|ORC commits & captures diff| R["Review Step\nRead-only plan mode"]
-    R -->|VERDICT: APPROVE| V["Test Gate\ntestCommand"]
-    R -->|VERDICT: REQUEST CHANGES| F["Fix Loop (max 2)"]
+    U["You / Architect Skill"] -->|"orc add / UI"| S["Spec File\ndocs/specs/*.md"]
+    S -->|"Ready"| I["Implement Step\nWorktree .worktrees/T-XXXX"]
+    I -->|"ORC commits & captures diff"| R["Review Step\nRead-only plan mode"]
+    R -->|"VERDICT: APPROVE"| V["Test Gate\ntestCommand"]
+    R -->|"VERDICT: REQUEST CHANGES"| F["Fix Loop (max 2)"]
     F --> I
-    V -->|Pass| D["Done (Worktree ready)"]
-    V -->|Fail (<2 loops)| F
-    D -->|Manual orc merge| M["Rebase + ff-only merge\nArchive .orc/ + Clean worktree"]
-    R & V -->|Limit reached / error| B["Blocked (Human decision)"]
+    V -->|"Pass"| D["Done (Worktree ready)"]
+    V -->|"Fail (<2 loops)"| F
+    D -->|"Manual orc merge"| M["Rebase + ff-only merge\nArchive .orc/ + Clean worktree"]
+    R & V -->|"Limit reached / error"| B["Blocked (Human decision)"]
 ```
 
 - **One active run per project** (`run.refused` on conflict) and a configurable global cap (`ORC_MAX_CONCURRENCY`, default `2`).
