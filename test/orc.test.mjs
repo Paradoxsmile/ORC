@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -22,16 +23,20 @@ const tempDir = mkdtempSync(path.join(os.tmpdir(), "orc-unit-"));
 process.env.ORC_CONFIG = path.join(tempDir, "orc.config.json");
 process.env.ORC_DATA_DIR = path.join(tempDir, "data");
 
-const { buildArgs, consumeLine, createStreamState, quoteCmd } = await import("../src/agents.js");
+const { buildArgs, consumeLine, createStreamState, detectAgents, quoteCmd } = await import(
+  "../src/agents.js"
+);
 const { addProject, updateProject } = await import("../src/config.js");
 const { db, isPidAlive, reapDeadRuns } = await import("../src/db.js");
 const { createTask, failTask, getTask, getTaskDetail, saveSpec, setState, updateTask } =
   await import("../src/board.js");
 const {
+  buildReviewPrompt,
   captureWork,
   checkConcurrency,
   createEventCoalescer,
   effortFor,
+  MAX_REVIEW_LOOPS,
   maxTrackedFileBytes,
   mergeTask,
   modelFor,
@@ -39,6 +44,7 @@ const {
   recoverWorktrees,
   removeTask,
   reviewerFor,
+  runTask,
   taskRuntimeInfo,
   unregisterProject,
   yoloFor,
@@ -193,7 +199,7 @@ describe("board and task state transitions", () => {
     const sameDetail = saveSpec(speccedTask.id, "# Refined spec\n");
     assert.equal(sameDetail.task.state, "specced");
 
-    const pathStates = ["working", "review", "fixing", "working", "review", "verify", "done"];
+    const pathStates = ["working", "verify", "fixing", "working", "verify", "review", "done"];
     for (const next of pathStates) {
       const moved = setState(speccedTask.id, next, { note: `to ${next}` });
       assert.equal(moved.state, next);
@@ -662,5 +668,227 @@ describe("hardening: cmd quoting, PID reaping, event coalescing, reviewer fallba
     assert.ok(existsSync(res.shPath));
     assert.match(readFileSync(res.cmdPath, "utf8"), /bin[/\\]orc\.js/);
     assert.match(readFileSync(res.shPath, "utf8"), /bin\/orc\.js/);
+  });
+});
+
+function createFakePipelineClis(fakeBin, reviewLogPath) {
+  mkdirSync(fakeBin, { recursive: true });
+
+  writeFileSync(
+    path.join(fakeBin, "fake-claude.js"),
+    `import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const dir = path.join(process.cwd(), "src");
+mkdirSync(dir, { recursive: true });
+const counterPath = path.join(dir, "attempt.txt");
+const count = existsSync(counterPath) ? Number(readFileSync(counterPath, "utf8").trim()) + 1 : 1;
+writeFileSync(counterPath, String(count) + "\\n", "utf8");
+const session = "fake-claude-session";
+console.log(JSON.stringify({ type: "system", subtype: "init", session_id: session }));
+console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Attempt " + count + "\\n" }] } }));
+console.log(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "Attempt " + count + "\\n", session_id: session }));
+`,
+    "utf8",
+  );
+
+  writeFileSync(
+    path.join(fakeBin, "fake-agy.js"),
+    `import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(reviewLogPath)}, process.cwd() + "\\n", "utf8");
+const conversation = "fake-agy-conversation";
+const response = "Review complete.\\n\\nVERDICT: APPROVE\\n";
+console.log(JSON.stringify({ event: "init", conversation_id: conversation, init: { cwd: process.cwd(), permission_mode: "plan" } }));
+console.log(JSON.stringify({ event: "step_update", step_update: { conversation_id: conversation, step_index: 1, state: "DONE", step_type: "agent_response", text_delta: response } }));
+console.log(JSON.stringify({ event: "result", result: { conversation_id: conversation, status: "SUCCESS", response, usage: { total_tokens: 10 } } }));
+`,
+    "utf8",
+  );
+
+  if (process.platform === "win32") {
+    writeFileSync(path.join(fakeBin, "claude.cmd"), '@echo off\r\nnode "%~dp0fake-claude.js" %*\r\n', "utf8");
+    writeFileSync(path.join(fakeBin, "agy.cmd"), '@echo off\r\nnode "%~dp0fake-agy.js" %*\r\n', "utf8");
+  } else {
+    for (const name of ["claude", "agy"]) {
+      const file = path.join(fakeBin, name);
+      writeFileSync(file, `#!/bin/sh\nexec node "${fakeBin}/fake-${name}.js" "$@"\n`, "utf8");
+      chmodSync(file, 0o755);
+    }
+  }
+}
+
+function initPipelineRepo(repoDir) {
+  mkdirSync(repoDir, { recursive: true });
+  writeFileSync(path.join(repoDir, ".gitignore"), ".worktrees/\n.orc/\n", "utf8");
+  writeFileSync(path.join(repoDir, "README.md"), "# pipeline repo\n", "utf8");
+  git(repoDir, ["init", "-b", "main"]);
+  git(repoDir, ["config", "user.name", "Test User"]);
+  git(repoDir, ["config", "user.email", "test@example.invalid"]);
+  git(repoDir, ["add", "-A"]);
+  git(repoDir, ["commit", "-m", "initial"]);
+}
+
+describe("pipeline order: verify before review", () => {
+  it("includes .orc/<taskId>/test.log in buildReviewPrompt only when test.log exists", () => {
+    const wt = path.join(tempDir, "review-prompt-wt");
+    const artifacts = path.join(wt, ".orc", "T-0100");
+    mkdirSync(artifacts, { recursive: true });
+
+    const task = { id: "T-0100", title: "Verify first", worktree: wt };
+    const project = { name: "demo" };
+
+    const withoutLog = buildReviewPrompt(task, project);
+    assert.match(withoutLog, /\.orc\/T-0100\/diff\.patch/);
+    assert.doesNotMatch(withoutLog, /\.orc\/T-0100\/test\.log/);
+
+    writeFileSync(path.join(artifacts, "test.log"), "ok\n", "utf8");
+    const withLog = buildReviewPrompt(task, project);
+    assert.match(withLog, /- Test log: \.orc\/T-0100\/test\.log/);
+  });
+
+  it("runs verify before review, skips review on failing tests, and handles empty testCommand", async () => {
+    const fakeBin = path.join(tempDir, "pipeline-fake-bin");
+    const reviewLogPath = path.join(tempDir, "reviewer-calls.log");
+    createFakePipelineClis(fakeBin, reviewLogPath);
+
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${savedPath ?? ""}`;
+    detectAgents(true);
+
+    const readReviewerCalls = () =>
+      existsSync(reviewLogPath)
+        ? readFileSync(reviewLogPath, "utf8").trim().split(/\r?\n/).filter(Boolean)
+        : [];
+
+    try {
+      // 1) Passing testCommand: implement -> verify -> review -> done
+      const passRepo = path.join(tempDir, "pipeline-pass");
+      initPipelineRepo(passRepo);
+      const passProj = addProject({
+        name: "pipeline-pass",
+        projectPath: passRepo,
+        baseBranch: "main",
+        testCommand: 'node -e "console.log(\'unit-pass\')"',
+      });
+      const passTask = createTask({
+        projectId: passProj.id,
+        title: "Pass test gate first",
+        description: "Verify runs before review",
+        acceptance: "- [ ] tests pass before review",
+        agent: "claude",
+      });
+
+      const passFinal = await runTask(passTask.id);
+      assert.equal(passFinal.state, "done");
+      const passDetail = getTaskDetail(passTask.id);
+      const passTransitions = passDetail.events
+        .filter((event) => event.type === "state")
+        .map((event) => event.data?.to);
+      assert.deepEqual(passTransitions, ["working", "verify", "review", "done"]);
+
+      const verifyPassedIdx = passDetail.events.findIndex((event) => event.type === "verify.passed");
+      const reviewApprovedIdx = passDetail.events.findIndex((event) => event.type === "review.approved");
+      assert.ok(verifyPassedIdx >= 0 && reviewApprovedIdx > verifyPassedIdx);
+
+      const passReviewPrompt = readFileSync(
+        path.join(passFinal.worktree, ".orc", passTask.id, "prompt-review.md"),
+        "utf8",
+      );
+      assert.match(passReviewPrompt, new RegExp(`\\.orc/${passTask.id}/test\\.log`));
+      assert.equal(readReviewerCalls().length, 1);
+
+      // 2) No testCommand configured: implement -> verify (skipped) -> review -> done
+      const noTestRepo = path.join(tempDir, "pipeline-notest");
+      initPipelineRepo(noTestRepo);
+      const noTestProj = addProject({
+        name: "pipeline-notest",
+        projectPath: noTestRepo,
+        baseBranch: "main",
+      });
+      const noTestTask = createTask({
+        projectId: noTestProj.id,
+        title: "No test command",
+        description: "Skips verify into review",
+        acceptance: "- [ ] proceeds to review",
+        agent: "claude",
+      });
+
+      const noTestFinal = await runTask(noTestTask.id);
+      assert.equal(noTestFinal.state, "done");
+      const noTestDetail = getTaskDetail(noTestTask.id);
+      const noTestTransitions = noTestDetail.events
+        .filter((event) => event.type === "state")
+        .map((event) => event.data?.to);
+      assert.deepEqual(noTestTransitions, ["working", "verify", "review", "done"]);
+      assert.equal(noTestDetail.artifacts.testExists, false);
+      const noTestReviewPrompt = readFileSync(
+        path.join(noTestFinal.worktree, ".orc", noTestTask.id, "prompt-review.md"),
+        "utf8",
+      );
+      assert.doesNotMatch(noTestReviewPrompt, /test\.log/);
+      assert.equal(readReviewerCalls().length, 2);
+
+      // 3) Failing testCommand: loops to fixing -> blocked without invoking reviewer
+      const failRepo = path.join(tempDir, "pipeline-fail");
+      initPipelineRepo(failRepo);
+      const failProj = addProject({
+        name: "pipeline-fail",
+        projectPath: failRepo,
+        baseBranch: "main",
+        testCommand: 'node -e "console.error(\'test boom\'); process.exit(1)"',
+      });
+      const failTaskItem = createTask({
+        projectId: failProj.id,
+        title: "Failing tests skip review",
+        description: "Broken tests should go to fixing then blocked",
+        acceptance: "- [ ] reviewer never called",
+        agent: "claude",
+      });
+
+      const failFinal = await runTask(failTaskItem.id);
+      assert.equal(failFinal.state, "blocked");
+      assert.equal(failFinal.review_loops, MAX_REVIEW_LOOPS);
+      const failDetail = getTaskDetail(failTaskItem.id);
+      const failTransitions = failDetail.events
+        .filter((event) => event.type === "state")
+        .map((event) => event.data?.to);
+      assert.deepEqual(failTransitions, ["working", "verify", "fixing", "working", "verify", "blocked"]);
+      assert.equal(failDetail.runs.filter((run) => run.step === "review").length, 0);
+      assert.equal(failDetail.artifacts.reviewExists, false);
+      assert.equal(failDetail.artifacts.testExists, true);
+      assert.equal(readReviewerCalls().length, 2);
+
+      // 4) Fails first verify, passes second verify after fix -> review runs once and approves
+      const fixRepo = path.join(tempDir, "pipeline-fix-then-pass");
+      initPipelineRepo(fixRepo);
+      const fixProj = addProject({
+        name: "pipeline-fix-then-pass",
+        projectPath: fixRepo,
+        baseBranch: "main",
+        testCommand:
+          'node -e "const fs=require(\'fs\'); const n=Number(fs.readFileSync(\'src/attempt.txt\',\'utf8\').trim()); process.exit(n>=2?0:1)"',
+      });
+      const fixTaskItem = createTask({
+        projectId: fixProj.id,
+        title: "Fix then pass tests",
+        description: "First test fails, fix passes, then reviewer approves",
+        acceptance: "- [ ] passes after one fix loop",
+        agent: "claude",
+      });
+
+      const fixFinal = await runTask(fixTaskItem.id);
+      assert.equal(fixFinal.state, "done");
+      assert.equal(fixFinal.review_loops, 1);
+      const fixDetail = getTaskDetail(fixTaskItem.id);
+      const fixTransitions = fixDetail.events
+        .filter((event) => event.type === "state")
+        .map((event) => event.data?.to);
+      assert.deepEqual(fixTransitions, ["working", "verify", "fixing", "working", "verify", "review", "done"]);
+      assert.equal(fixDetail.runs.filter((run) => run.step === "review").length, 1);
+      assert.equal(readReviewerCalls().length, 3);
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      detectAgents(true);
+    }
   });
 });

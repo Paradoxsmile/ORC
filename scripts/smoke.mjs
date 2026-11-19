@@ -50,7 +50,7 @@ function writeFakeClis() {
 import path from "node:path";
 const dir = path.join(process.cwd(), "src");
 mkdirSync(dir, { recursive: true });
-writeFileSync(path.join(dir, "feature.txt"), "feature " + Date.now() + "\\n");
+writeFileSync(path.join(dir, "feature.txt"), "feature " + Date.now() + "-" + process.pid + "\\n");
 const session = "fake-claude-session";
 console.log(JSON.stringify({ type: "system", subtype: "init", session_id: session }));
 console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Implemented the task.\\n" }] } }));
@@ -117,7 +117,7 @@ async function main() {
   process.env.ORC_DATA_DIR = dataDir;
   process.env.PATH = `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`;
 
-  const { addProject, initProject } = await import("../src/config.js");
+  const { addProject, initProject, updateProject } = await import("../src/config.js");
   const { createTask, getTaskDetail } = await import("../src/board.js");
   const { mergeTask, runTask } = await import("../src/dispatch.js");
   const { startServer } = await import("../src/server.js");
@@ -190,6 +190,25 @@ async function main() {
     if (!detail.diff.includes("src/feature.txt")) throw new Error("diff does not contain feature.txt");
     if (!detail.test.includes("tests ok")) throw new Error("test log missing output");
 
+    const stateOrder = detail.events
+      .filter((event) => event.type === "state")
+      .map((event) => event.data?.to);
+    if (stateOrder.join("->") !== "working->verify->review->done") {
+      throw new Error(`expected working->verify->review->done, got ${stateOrder.join("->")}`);
+    }
+    const verifyPassedIdx = detail.events.findIndex((event) => event.type === "verify.passed");
+    const reviewApprovedIdx = detail.events.findIndex((event) => event.type === "review.approved");
+    if (verifyPassedIdx < 0 || reviewApprovedIdx <= verifyPassedIdx) {
+      throw new Error("expected verify.passed before review.approved");
+    }
+    const reviewPrompt = readFileSync(
+      path.join(repoDir, ".worktrees", task.id, ".orc", task.id, "prompt-review.md"),
+      "utf8",
+    );
+    if (!reviewPrompt.includes(`.orc/${task.id}/test.log`)) {
+      throw new Error("prompt-review.md missing test.log reference");
+    }
+
     const branch = git(repoDir, ["branch", "--list", task.branch]);
     if (!branch.includes(task.branch)) throw new Error("task branch missing");
     if (!existsSync(path.join(repoDir, ".worktrees", task.id, "src", "feature.txt"))) {
@@ -251,6 +270,41 @@ async function main() {
       throw new Error("archived artifacts missing after merge");
     }
     log("merge, cleanup, archived artifacts: ok");
+
+    updateProject(project.id, { testCommand: 'node -e "console.error(\'smoke fail\'); process.exit(1)"' });
+    const failingTask = createTask({
+      projectId: project.id,
+      title: "Failing test skips review",
+      description: "Verify failure must loop to fixing/blocked without calling reviewer.",
+      acceptance: "- [ ] reviewer is never invoked",
+    });
+    const failingFinal = await runTask(failingTask.id);
+    if (failingFinal.state !== "blocked") {
+      throw new Error(`expected failing task to be blocked, got ${failingFinal.state}`);
+    }
+    const failingDetail = getTaskDetail(failingTask.id);
+    const failingStates = failingDetail.events
+      .filter((event) => event.type === "state")
+      .map((event) => event.data?.to);
+    if (failingStates.join("->") !== "working->verify->fixing->working->verify->blocked") {
+      throw new Error(`unexpected failing task states: ${failingStates.join("->")}`);
+    }
+    if (failingDetail.runs.some((run) => run.step === "review")) {
+      throw new Error("reviewer should not be invoked when tests fail");
+    }
+    if (failingDetail.artifacts.reviewExists) {
+      throw new Error("review.md should not exist when tests fail");
+    }
+    if (!failingDetail.artifacts.testExists) {
+      throw new Error("test.log missing for failing task");
+    }
+    const delFailRes = await fetch(`http://127.0.0.1:${port}/api/tasks/${failingTask.id}/delete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cleanupWorktree: true }),
+    });
+    if (!delFailRes.ok) throw new Error(`failing task delete failed: ${delFailRes.status}`);
+    log("verify-before-review & failing test skips reviewer: ok");
 
     const probeDir = path.join(temp, "probes");
     execFileSync(process.execPath, [path.join(ROOT, "scripts", "probe.mjs"), "--out", probeDir], {

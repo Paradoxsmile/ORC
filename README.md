@@ -18,7 +18,7 @@ It owns **artifacts and processes** — specs, worktrees, diffs, review verdicts
 
 - **Separate subscriptions, zero API proxying:** `claude` keeps its login and quota; `agy` keeps its login and quota. ORC spawns the official CLIs headlessly and never stores OAuth tokens or proxies vendor traffic.
 - **Focused context per subtask:** Instead of dumping a 100k-token chat history into one session, each task gets a concise spec file (`docs/specs/YYYY-MM-DD-<slug>.md`) and runs in its own isolated Git worktree (`.worktrees/T-0001`).
-- **Cross-agent verification:** One CLI implements (`acceptEdits` / `accept-edits`) and the other reviews in read-only `plan` mode, returning a machine-readable `VERDICT: APPROVE` or `VERDICT: REQUEST CHANGES` (bounded to 2 fix loops) followed by your test gate.
+- **Cross-agent verification:** One CLI implements (`acceptEdits` / `accept-edits`), your test gate runs first, and once green the other CLI reviews in read-only `plan` mode, returning a machine-readable `VERDICT: APPROVE` or `VERDICT: REQUEST CHANGES` (bounded to 2 fix loops).
 - **Zero-dependency stack:** Pure Node.js ESM (`>=22.5`, `node:sqlite`), vanilla HTML/CSS/JS dashboard with Server-Sent Events (SSE), no npm packages, no build step.
 - **Obsidian-ready memory:** Every registered repo scaffolds `AGENTS.md`, `docs/index.md`, `docs/architecture.md`, `docs/decisions/`, `docs/specs/`, and an auto-updated `docs/board.md`.
 
@@ -30,14 +30,14 @@ It owns **artifacts and processes** — specs, worktrees, diffs, review verdicts
 flowchart LR
     U["You / Architect Skill"] -->|"orc add / UI"| S["Spec File\ndocs/specs/*.md"]
     S -->|"Ready"| I["Implement Step\nWorktree .worktrees/T-XXXX"]
-    I -->|"ORC commits & captures diff"| R["Review Step\nRead-only plan mode"]
-    R -->|"VERDICT: APPROVE"| V["Test Gate\ntestCommand"]
-    R -->|"VERDICT: REQUEST CHANGES"| F["Fix Loop (max 2)"]
+    I -->|"ORC commits & captures diff"| V["Test Gate\ntestCommand"]
+    V -->|"Pass / none"| R["Review Step\nRead-only plan mode"]
+    V -->|"Fail (<2 loops)"| F["Fix Loop (max 2)"]
+    R -->|"VERDICT: APPROVE"| D["Done (Worktree ready)"]
+    R -->|"VERDICT: REQUEST CHANGES"| F
     F --> I
-    V -->|"Pass"| D["Done (Worktree ready)"]
-    V -->|"Fail (<2 loops)"| F
     D -->|"Manual orc merge"| M["Rebase + ff-only merge\nArchive .orc/ + Clean worktree"]
-    R & V -->|"Limit reached / error"| B["Blocked (Human decision)"]
+    V & R -->|"Limit reached / error"| B["Blocked (Human decision)"]
 ```
 
 - **One active run per project** (`run.refused` on conflict) and a configurable global cap (`ORC_MAX_CONCURRENCY`, default `2`).
@@ -86,7 +86,7 @@ orc add my-app "Retry failed uploads once" \
 
 # 3. Start the dashboard OR run directly from the CLI
 orc serve          # Dashboard at http://127.0.0.1:4317
-orc run T-0001     # Run implement → review → test loop
+orc run T-0001     # Run implement → verify → review loop
 
 # 4. Inspect diff/review in the dashboard, then merge locally when satisfied
 orc merge T-0001
@@ -124,7 +124,7 @@ Open **`http://127.0.0.1:4317`** after running `orc serve`:
 | `orc init <project\|path>` | Write `AGENTS.md`, `docs/`, and `.gitignore` scaffold only |
 | `orc add <project> "<title>" [flags]` | Create task (`T-XXXX`), spec file, and branch name (`--desc`, `--accept`, `--agent claude\|agy`) |
 | `orc list [project]` | List tasks across all or one project |
-| `orc run <taskId>` | Run the implement → review → verify pipeline |
+| `orc run <taskId>` | Run the implement → verify → review pipeline |
 | `orc stop <taskId>` | Stop the active run (works across terminals via SQLite PID) |
 | `orc merge <taskId>` | Rebase task branch onto `baseBranch`, fast-forward, archive `.orc/`, remove worktree & branch, mark `done` |
 | `orc delete <taskId> [--clean]` | Delete task from board (`--clean` also removes its worktree & `.orc/` artifacts) |

@@ -409,10 +409,10 @@ export async function runTask(taskId, { actor = "you" } = {}) {
 
       if (["specced", "working", "fixing"].includes(task.state)) {
         await implementStep(task, project, controller);
-      } else if (task.state === "review") {
-        await reviewStep(task, project, controller);
       } else if (task.state === "verify") {
         await verifyStep(task, project, controller);
+      } else if (task.state === "review") {
+        await reviewStep(task, project, controller);
       } else {
         throw new Error(`Cannot run a task from state "${task.state}"`);
       }
@@ -631,8 +631,15 @@ async function implementStep(task, project, controller) {
   if (promptFile !== "prompt-implement.md") {
     writeFileSync(path.join(artifactsDir, "prompt-implement.md"), prompt, "utf8");
   }
+  const fixFiles = [`.orc/${task.id}/${promptFile}`];
+  if (fixing && existsSync(path.join(artifactsDir, "review.md"))) {
+    fixFiles.push(`.orc/${task.id}/review.md`);
+  }
+  if (fixing && existsSync(path.join(artifactsDir, "test.log"))) {
+    fixFiles.push(`.orc/${task.id}/test.log`);
+  }
   const cliPrompt = fixing
-    ? `The reviewer requested changes (or tests failed). Read .orc/${task.id}/${promptFile} and .orc/${task.id}/review.md, then apply the requested fixes in this worktree.`
+    ? `Tests failed or the reviewer requested changes. Read ${fixFiles.join(", ")}, then apply the requested fixes in this worktree.`
     : `Read and follow .orc/${task.id}/prompt-implement.md in this worktree.`;
 
   const before = (await git(worktree, ["rev-parse", "HEAD"], { allowFailure: true })).stdout.trim();
@@ -698,8 +705,11 @@ async function implementStep(task, project, controller) {
     data: { head },
   });
 
-  setState(task.id, "review", {
-    note: `${agentLabel(implementer)} ${label} complete · ${agentLabel(reviewerFor(implementer, { project }))} will review`,
+  const hasTest = Boolean(String(project.testCommand ?? "").trim());
+  setState(task.id, "verify", {
+    note: hasTest
+      ? `${agentLabel(implementer)} ${label} complete · running test gate`
+      : `${agentLabel(implementer)} ${label} complete · proceeding to ${agentLabel(reviewerFor(implementer, { project }))} review`,
     actor: "orc",
   });
 }
@@ -783,7 +793,7 @@ async function reviewStep(task, project, controller) {
   if (verdict === "approve") {
     updateTask(task.id, { review_verdict: "approve", last_error: null });
     addEvent({ taskId: task.id, runId, actor: reviewer, type: "review.approved", text: "VERDICT: APPROVE" });
-    setState(task.id, "verify", { note: "Review approved", actor: "orc" });
+    setState(task.id, "done", { note: "Review approved", actor: "orc" });
     return;
   }
 
@@ -809,14 +819,19 @@ async function reviewStep(task, project, controller) {
 
 async function verifyStep(task, project, controller) {
   const command = String(project.testCommand ?? "").trim();
+  const reviewer = reviewerFor(task.agent, { project });
   if (!command) {
     updateTask(task.id, { last_error: null });
-    setState(task.id, "done", { note: "No test command configured — verification skipped", actor: "orc" });
+    setState(task.id, "review", {
+      note: `No test command configured — proceeding to ${agentLabel(reviewer)} review`,
+      actor: "orc",
+    });
     return;
   }
 
   if (!task.worktree) throw new Error("Task has no worktree to verify.");
   const artifactsDir = path.join(task.worktree, ".orc", task.id);
+  ensureDir(artifactsDir);
   const testPath = path.join(artifactsDir, "test.log");
   const runId = startRun(task.id, "shell", "verify");
 
@@ -856,7 +871,10 @@ async function verifyStep(task, project, controller) {
   if (result.code === 0 && !result.error) {
     updateTask(task.id, { last_error: null });
     addEvent({ taskId: task.id, runId, actor: "orc", type: "verify.passed", text: command });
-    setState(task.id, "done", { note: "Tests passed", actor: "orc" });
+    setState(task.id, "review", {
+      note: `Tests passed · ${agentLabel(reviewer)} will review`,
+      actor: "orc",
+    });
     return;
   }
 
@@ -918,8 +936,9 @@ function buildImplementPrompt(task, project, { fixing, worktree }) {
   return `${lines.join("\n")}\n`;
 }
 
-function buildReviewPrompt(task, project) {
+export function buildReviewPrompt(task, project) {
   const artifacts = `.orc/${task.id}`;
+  const hasTestLog = Boolean(task.worktree && existsSync(path.join(task.worktree, ".orc", task.id, "test.log")));
   const lines = [
     `# Review ${task.id} — ${task.title}`,
     "",
@@ -929,6 +948,7 @@ function buildReviewPrompt(task, project) {
     "## Read",
     `- Spec: ${artifacts}/spec.md`,
     `- Diff: ${artifacts}/diff.patch`,
+    ...(hasTestLog ? [`- Test log: ${artifacts}/test.log`] : []),
     `- Task metadata: ${artifacts}/task.json`,
     "- AGENTS.md, if it helps verify project rules.",
     "",
