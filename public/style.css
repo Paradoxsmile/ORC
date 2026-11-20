@@ -530,6 +530,7 @@ a {
 }
 
 .card.state-specced { border-left-color: var(--violet); }
+.card.state-queued { border-left-color: #38bdf8; }
 .card.state-working,
 .card.state-fixing { border-left-color: var(--amber); }
 .card.state-review,
@@ -544,6 +545,52 @@ a {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 5px;
+}
+
+.card-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.mini-tag {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: var(--panel-2);
+  white-space: nowrap;
+}
+
+.mini-tag.research {
+  color: #c4b5fd;
+  border-color: #4c3a75;
+  background: rgba(167, 139, 250, 0.12);
+}
+
+.mini-tag.tier-low {
+  color: #86efac;
+  border-color: #245238;
+  background: rgba(74, 222, 128, 0.08);
+}
+
+.mini-tag.tier-high {
+  color: #fde68a;
+  border-color: #5b4a20;
+  background: rgba(251, 191, 36, 0.08);
+}
+
+.mini-tag.dep {
+  color: #bae6fd;
+  border-color: #264a63;
+  background: rgba(125, 211, 252, 0.08);
+  text-transform: none;
 }
 
 .task-id {
@@ -564,6 +611,7 @@ a {
   white-space: nowrap;
 }
 
+.state-pill.queued { color: #bae6fd; border-color: #264a63; background: rgba(56, 189, 248, 0.09); }
 .state-pill.blocked { color: #fecaca; border-color: #5a2d33; background: rgba(248, 113, 113, 0.08); }
 .state-pill.working,
 .state-pill.fixing { color: #fde68a; border-color: #5b4a20; background: rgba(251, 191, 36, 0.07); }

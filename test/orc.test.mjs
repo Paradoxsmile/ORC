@@ -31,16 +31,28 @@ const { db, isPidAlive, reapDeadRuns } = await import("../src/db.js");
 const { createTask, failTask, getTask, getTaskDetail, saveSpec, setState, updateTask } =
   await import("../src/board.js");
 const {
+  buildImplementPrompt,
+  buildResearchPrompt,
   buildReviewPrompt,
   captureWork,
   checkConcurrency,
+  checkDependencies,
+  checkQuotaGuardrail,
+  clearVendorQuota,
+  compactHandoff,
   createEventCoalescer,
+  drainQueue,
   effortFor,
+  formatFixContext,
+  getQuotaSnapshot,
   MAX_REVIEW_LOOPS,
   maxTrackedFileBytes,
   mergeTask,
   modelFor,
   parseVerdict,
+  pauseThreshold,
+  queueTask,
+  recordVendorQuota,
   recoverWorktrees,
   removeTask,
   reviewerFor,
@@ -891,5 +903,346 @@ describe("pipeline order: verify before review", () => {
       else process.env.PATH = savedPath;
       detectAgents(true);
     }
+  });
+});
+
+describe("Issue #6 & compact protocol: diffIgnore, tail-trimmed fix context, tiered routing", () => {
+  it("omits lockfile/minified hunks from diff.patch while prepending diff --stat and committing them", async () => {
+    const repo = path.join(tempDir, "diff-ignore-repo");
+    initPipelineRepo(repo);
+    git(repo, ["checkout", "-b", "task/T-0601-diff-ignore"]);
+    const before = git(repo, ["rev-parse", "HEAD"]);
+
+    mkdirSync(path.join(repo, "src"), { recursive: true });
+    writeFileSync(path.join(repo, "src", "logic.js"), "export const ok = 42;\n", "utf8");
+    writeFileSync(path.join(repo, "package-lock.json"), '{"lockfileVersion":3,"huge":"LOCK_MARKER"}\n', "utf8");
+    writeFileSync(path.join(repo, "bundle.min.js"), "var MINIFIED_MARKER=1;\n", "utf8");
+
+    const task = { id: "T-0601", title: "Diff ignore check" };
+    const filtered = await captureWork(repo, task, { baseBranch: "main" }, "implementation", before);
+    assert.match(filtered.patch, /# diff --stat/);
+    assert.match(filtered.patch, /src\/logic\.js/);
+    assert.match(filtered.patch, /export const ok = 42;/);
+    assert.doesNotMatch(filtered.patch, /LOCK_MARKER/);
+    assert.doesNotMatch(filtered.patch, /MINIFIED_MARKER/);
+    assert.ok(filtered.omittedFiles.includes("package-lock.json"));
+    assert.ok(filtered.omittedFiles.includes("bundle.min.js"));
+
+    // Lockfile was still committed to git so the branch is intact
+    const committed = git(repo, ["ls-tree", "-r", "HEAD", "--name-only"]);
+    assert.match(committed, /package-lock\.json/);
+
+    // Disabling diffIgnore via ["none"] restores full lockfile hunks
+    const unfiltered = await captureWork(
+      repo,
+      task,
+      { baseBranch: "main", diffIgnore: ["none"] },
+      "fix",
+      filtered.head,
+    );
+    assert.match(unfiltered.patch, /LOCK_MARKER/);
+  });
+
+  it("preserves full review.md and keeps the tail of test.log in fix-loop context", () => {
+    const review = "src/app.js:12|high|null deref|guard req.user";
+    const noisyPrefix = "PASS test/a.test.mjs\n".repeat(400);
+    const tailFailure = "FAIL AssertionError: expected 401 to equal 200 at src/auth.js:88";
+    const ctx = formatFixContext(review, `${noisyPrefix}\n${tailFailure}`, {
+      reviewMax: 6000,
+      testMax: 500,
+    });
+
+    assert.match(ctx, /null deref/);
+    assert.match(ctx, /expected 401 to equal 200/);
+    assert.match(ctx, /earlier test output trimmed/);
+  });
+
+  it("emits compact machine-dense prompts by default and honors ORC_COMPACT_HANDOFF=0", () => {
+    const wt = path.join(tempDir, "compact-prompt-wt");
+    mkdirSync(path.join(wt, ".orc", "T-0602"), { recursive: true });
+    const task = { id: "T-0602", title: "Compact check", tier: "low", worktree: wt };
+    const project = { name: "demo", testCommand: "node --test" };
+
+    withEnv({ ORC_COMPACT_HANDOFF: undefined }, () => {
+      assert.equal(compactHandoff(), true);
+      const impl = buildImplementPrompt(task, project, { fixing: false, worktree: wt });
+      assert.match(impl, /TASK:T-0602\|Compact check\|TIER:low/);
+      assert.match(impl, /CHANGED:/);
+      const rev = buildReviewPrompt(task, project);
+      assert.match(rev, /FILE:LINE\|SEV/);
+      assert.match(rev, /Do not run shell commands/i);
+    });
+
+    withEnv({ ORC_COMPACT_HANDOFF: "0" }, () => {
+      assert.equal(compactHandoff(), false);
+      const impl = buildImplementPrompt(task, project, { fixing: false, worktree: wt });
+      assert.match(impl, /# Task T-0602/);
+    });
+  });
+
+  it("routes models by tier (low/med/high) with reviewer defaulting to high tier", () => {
+    const lowTask = { tier: "low" };
+    const highTask = { tier: "high" };
+
+    withEnv(
+      {
+        ORC_CLAUDE_LOW_MODEL: "haiku",
+        ORC_CLAUDE_HIGH_MODEL: "opus",
+        ORC_CLAUDE_IMPL_MODEL: undefined,
+        ORC_CLAUDE_REVIEW_MODEL: undefined,
+        ORC_CLAUDE_MODEL: undefined,
+      },
+      () => {
+        assert.equal(modelFor("claude", "impl", null, lowTask), "haiku");
+        assert.equal(modelFor("claude", "review", null, lowTask), "opus");
+        assert.equal(modelFor("claude", "impl", null, highTask), "opus");
+      },
+    );
+
+    // Built-in low-tier plan-saver routes Claude low tasks to sonnet when unset
+    withEnv(
+      {
+        ORC_CLAUDE_LOW_MODEL: undefined,
+        ORC_CLAUDE_IMPL_MODEL: undefined,
+        ORC_CLAUDE_MODEL: undefined,
+        ORC_TIER_DEFAULTS: undefined,
+      },
+      () => {
+        assert.equal(modelFor("claude", "impl", null, lowTask), "sonnet");
+        assert.equal(modelFor("claude", "impl", null, { tier: "med" }), null);
+      },
+    );
+
+    // Task explicit override wins over project and env
+    assert.equal(
+      modelFor("agy", "impl", { implModel: "proj-model" }, { tier: "low", impl_model: "task-model" }),
+      "task-model",
+    );
+  });
+});
+
+describe("Issue #4: token/cost telemetry and quota guardrails", () => {
+  it("extracts token usage and cost from Claude, Antigravity, and Codex streams", () => {
+    const claudeState = createStreamState();
+    consumeLine(
+      "claude",
+      JSON.stringify({
+        type: "result",
+        subtype: "success",
+        result: "ok",
+        total_cost_usd: 0.042,
+        usage: { input_tokens: 1500, output_tokens: 250, cache_read_input_tokens: 900 },
+      }),
+      claudeState,
+      () => {},
+    );
+    assert.equal(claudeState.usage.inputTokens, 1500);
+    assert.equal(claudeState.usage.outputTokens, 250);
+    assert.equal(claudeState.usage.cacheReadTokens, 900);
+    assert.equal(claudeState.usage.costUsd, 0.042);
+
+    const agyState = createStreamState();
+    consumeLine(
+      "agy",
+      JSON.stringify({
+        event: "result",
+        result: {
+          status: "SUCCESS",
+          response: "done",
+          usage: { input_tokens: 2000, output_tokens: 300, thinking_tokens: 400, cache_read_tokens: 1200 },
+        },
+      }),
+      agyState,
+      () => {},
+    );
+    assert.equal(agyState.usage.inputTokens, 2000);
+    assert.equal(agyState.usage.outputTokens, 300);
+    assert.equal(agyState.usage.thinkingTokens, 400);
+    assert.equal(agyState.usage.cacheReadTokens, 1200);
+  });
+
+  it("pauses launches when vendor utilization exceeds ORC_PAUSE_ON_UTILIZATION", () => {
+    clearVendorQuota();
+    try {
+      assert.equal(pauseThreshold({ ORC_PAUSE_ON_UTILIZATION: "0.90" }), 0.9);
+      assert.equal(pauseThreshold({ ORC_PAUSE_ON_UTILIZATION: "85" }), 0.85);
+      assert.equal(pauseThreshold({}), null);
+
+      recordVendorQuota("claude", {
+        status: "allowed_warning",
+        rateLimitType: "seven_day",
+        utilization: 0.95,
+      });
+      assert.equal(getQuotaSnapshot().claude.utilization, 0.95);
+
+      const dir = path.join(tempDir, "quota-repo");
+      mkdirSync(dir, { recursive: true });
+      const proj = addProject({ name: "quota-repo", projectPath: dir });
+      const task = createTask({ projectId: proj.id, title: "Quota test", description: "desc" });
+
+      const paused = checkQuotaGuardrail("claude", task.id, {
+        env: { ORC_PAUSE_ON_UTILIZATION: "0.90" },
+      });
+      assert.equal(paused.paused, true);
+      assert.match(paused.message, /95%/);
+      assert.ok(getTaskDetail(task.id).events.some((e) => e.type === "run.paused_quota"));
+
+      const allowed = checkQuotaGuardrail("agy", task.id, {
+        env: { ORC_PAUSE_ON_UTILIZATION: "0.90" },
+      });
+      assert.equal(allowed.paused, false);
+    } finally {
+      clearVendorQuota();
+    }
+  });
+});
+
+describe("Issue #5: per-project task queue and --depends-on", () => {
+  it("blocks direct run on unmet dependencies, halts on blocked upstream, and drains when upstream finishes", async () => {
+    const dir = path.join(tempDir, "queue-repo");
+    mkdirSync(dir, { recursive: true });
+    const proj = addProject({ name: "queue-repo", projectPath: dir });
+
+    const t1 = createTask({ projectId: proj.id, title: "Upstream task", description: "first" });
+    const t2 = createTask({
+      projectId: proj.id,
+      title: "Downstream task",
+      description: "second",
+      dependsOn: t1.id,
+    });
+
+    assert.equal(checkDependencies(t2).ok, false);
+    assert.deepEqual(checkDependencies(t2).pending, [t1.id]);
+    await assert.rejects(() => runTask(t2.id), /unmet dependencies/);
+
+    queueTask(t2.id, { autoDrain: false });
+    assert.equal(getTask(t2.id).state, "queued");
+    assert.equal(drainQueue(proj.id, { triggerRun: false }), null);
+
+    // If upstream blocks, queue halts downstream with queue.halted
+    failTask(t1.id, "upstream broke");
+    assert.equal(drainQueue(proj.id, { triggerRun: false }), null);
+    assert.ok(getTaskDetail(t2.id).events.some((e) => e.type === "queue.halted"));
+
+    // Once upstream reaches done, drainQueue picks t2 as runnable
+    setState(t1.id, "done", { note: "resolved" });
+    const picked = drainQueue(proj.id, { triggerRun: false });
+    assert.equal(picked?.id, t2.id);
+  });
+});
+
+describe("Issue #2: read-only research mode", () => {
+  it("runs read-only research without worktrees, writes docs/research notes and brief.md", async () => {
+    const fakeBin = path.join(tempDir, "research-fake-bin");
+    const reviewLogPath = path.join(tempDir, "research-calls.log");
+    createFakePipelineClis(fakeBin, reviewLogPath);
+
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}${path.delimiter}${savedPath ?? ""}`;
+    detectAgents(true);
+
+    try {
+      const repo = path.join(tempDir, "research-repo");
+      initPipelineRepo(repo);
+      const proj = addProject({ name: "research-repo", projectPath: repo, baseBranch: "main" });
+
+      const resTask = createTask({
+        projectId: proj.id,
+        title: "Map auth flow",
+        description: "Find all token verification paths",
+        kind: "research",
+        agent: "agy",
+        researchAgents: "agy",
+        tier: "low",
+      });
+      assert.equal(resTask.kind, "research");
+      assert.equal(resTask.branch, null);
+      assert.equal(resTask.state, "specced");
+      assert.match(buildResearchPrompt(resTask, proj, "agy"), /read-only codebase researcher/i);
+
+      const headBefore = git(repo, ["rev-parse", "HEAD"]);
+      const done = await runTask(resTask.id);
+      assert.equal(done.state, "done");
+      assert.equal(done.worktree, null);
+      assert.equal(existsSync(path.join(repo, ".worktrees")), false);
+      assert.equal(git(repo, ["rev-parse", "HEAD"]), headBefore);
+
+      const detail = getTaskDetail(resTask.id);
+      assert.equal(detail.artifacts.briefExists, true);
+      assert.match(detail.brief, /# Brief · /);
+      assert.ok(detail.events.some((e) => e.type === "research.completed"));
+      assert.ok(detail.usage.totalTokens >= 0);
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      detectAgents(true);
+    }
+  });
+});
+
+describe("Issue #3: OpenAI Codex CLI adapter", () => {
+  it("builds codex exec flags for impl, review, resume, and yolo", () => {
+    const implArgs = buildArgs("codex", "Implement spec", { mode: null, model: "gpt-5-codex" });
+    assert.deepEqual(implArgs, [
+      "exec",
+      "--json",
+      "--sandbox",
+      "workspace-write",
+      "--full-auto",
+      "--model",
+      "gpt-5-codex",
+      "Implement spec",
+    ]);
+
+    const reviewArgs = buildArgs("codex", "Review diff", { mode: "plan" });
+    assert.deepEqual(reviewArgs, ["exec", "--json", "--sandbox", "read-only", "Review diff"]);
+
+    const resumeArgs = buildArgs("codex", "Apply fix", { sessionId: "codex-thread-77" });
+    assert.deepEqual(resumeArgs, ["exec", "resume", "codex-thread-77", "--json", "Apply fix"]);
+
+    const yoloArgs = buildArgs("codex", "Implement", { mode: null, yolo: true });
+    assert.ok(yoloArgs.includes("--dangerously-bypass-approvals-and-sandbox"));
+    assert.ok(!yoloArgs.includes("--full-auto"));
+  });
+
+  it("parses Codex JSONL fixture including thread_id, tools, text, usage, and errors", () => {
+    const lines = readFileSync(path.join(FIXTURES_DIR, "codex-stream.jsonl"), "utf8")
+      .trim()
+      .split(/\r?\n/);
+    const state = createStreamState();
+    const events = [];
+
+    for (const line of lines) {
+      consumeLine("codex", line, state, (event) => events.push(event));
+    }
+
+    assert.equal(state.sessionId, "codex-thread-77");
+    assert.match(state.text, /VERDICT: APPROVE/);
+    assert.equal(state.usage.inputTokens, 1240);
+    assert.equal(state.usage.cacheReadTokens, 800);
+    assert.equal(state.usage.outputTokens, 95);
+    assert.ok(events.some((e) => e.kind === "tool" && e.text.includes("git status")));
+    assert.ok(events.some((e) => e.kind === "tool" && e.text.includes("src/app.js")));
+    assert.equal(state.lastError, null);
+
+    consumeLine(
+      "codex",
+      JSON.stringify({ type: "turn.failed", error: { message: "Rate limit hit" } }),
+      state,
+      (event) => events.push(event),
+    );
+    assert.equal(state.lastError, "Rate limit hit");
+  });
+
+  it("supports codex in reviewerFor", () => {
+    assert.equal(reviewerFor("codex", { env: {} }), "claude");
+    assert.equal(reviewerFor("claude", { env: { ORC_REVIEWER: "codex" } }), "codex");
+    assert.equal(
+      reviewerFor("codex", {
+        env: { ORC_REVIEWER: "auto" },
+        health: { codex: { available: true }, claude: { available: false }, agy: { available: true } },
+      }),
+      "agy",
+    );
   });
 });

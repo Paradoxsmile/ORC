@@ -15,13 +15,33 @@ import {
   uniquePath,
 } from "./util.js";
 
-export const STATES = ["inbox", "specced", "working", "review", "fixing", "verify", "done", "blocked"];
+export const STATES = [
+  "inbox",
+  "specced",
+  "queued",
+  "working",
+  "review",
+  "fixing",
+  "verify",
+  "done",
+  "blocked",
+];
+
+export const TIERS = ["low", "med", "high"];
+export const KINDS = ["code", "research"];
+export const AGENTS = ["claude", "agy", "codex"];
 
 export const bus = new EventEmitter();
 
 const TASK_FIELDS = new Set([
   "state",
   "agent",
+  "kind",
+  "tier",
+  "depends_on",
+  "impl_model",
+  "review_model",
+  "research_agents",
   "branch",
   "worktree",
   "spec_path",
@@ -31,6 +51,50 @@ const TASK_FIELDS = new Set([
   "review_loops",
   "last_error",
 ]);
+
+export function normalizeAgent(value) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  return AGENTS.includes(clean) ? clean : "claude";
+}
+
+export function normalizeTier(value) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  return TIERS.includes(clean) ? clean : "med";
+}
+
+export function normalizeKind(value) {
+  const clean = String(value ?? "").trim().toLowerCase();
+  return KINDS.includes(clean) ? clean : "code";
+}
+
+export function normalizeDependsOn(value) {
+  const items = Array.isArray(value)
+    ? value
+    : String(value ?? "")
+        .split(/[\s,]+/)
+        .filter(Boolean);
+  const clean = [...new Set(items.map((item) => String(item).trim().toUpperCase()).filter(Boolean))];
+  return clean.length ? clean.join(",") : null;
+}
+
+export function parseDependsOn(value) {
+  if (!value) return [];
+  return String(value)
+    .split(",")
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+}
+
+export function normalizeResearchAgents(value, fallbackAgent = "claude") {
+  const items = Array.isArray(value)
+    ? value
+    : String(value ?? "")
+        .split(/[\s,]+/)
+        .filter(Boolean);
+  const valid = [...new Set(items.map((a) => String(a).trim().toLowerCase()).filter((a) => AGENTS.includes(a)))];
+  if (valid.length) return valid.join(",");
+  return normalizeAgent(fallbackAgent);
+}
 
 function template(name) {
   return readText(path.join(ROOT, "templates", name));
@@ -73,27 +137,73 @@ export function addEvent({
   return event;
 }
 
-export function createTask({ projectId, title, description = "", acceptance = "", agent = "claude" }) {
+export function createTask({
+  projectId,
+  title,
+  description = "",
+  acceptance = "",
+  agent = "claude",
+  kind = "code",
+  tier = "med",
+  dependsOn = null,
+  implModel = "",
+  reviewModel = "",
+  researchAgents = null,
+}) {
   const project = resolveProject(projectId);
   if (!project) throw new Error(`Unknown project: ${projectId}`);
   const cleanTitle = String(title ?? "").trim();
   if (!cleanTitle) throw new Error("Title is required");
 
+  const normKind = normalizeKind(kind);
+  const normAgent = normalizeAgent(agent);
+  const normTier = normalizeTier(tier);
+  const normDepends = normalizeDependsOn(dependsOn);
+  const normImplModel = String(implModel ?? "").trim() || null;
+  const normReviewModel = String(reviewModel ?? "").trim() || null;
+  const normResearchAgents =
+    normKind === "research" ? normalizeResearchAgents(researchAgents, normAgent) : null;
+
   const slug = slugify(cleanTitle);
   const id = nextTaskId();
-  const branch = `task/${id}-${slug}`;
-  const specPath = uniquePath(path.join(project.path, "docs", "specs", `${today()}-${slug}.md`));
-  const state = description.trim() || acceptance.trim() ? "specced" : "inbox";
+  const branch = normKind === "research" ? null : `task/${id}-${slug}`;
+  const specPath =
+    normKind === "research"
+      ? uniquePath(path.join(project.path, "docs", "research", `${today()}-${slug}-question.md`))
+      : uniquePath(path.join(project.path, "docs", "specs", `${today()}-${slug}.md`));
+  const state =
+    normKind === "research" || description.trim() || acceptance.trim() ? "specced" : "inbox";
 
-  const spec = renderTemplate(template("spec.md"), {
-    TITLE: cleanTitle,
-    DATE: today(),
-    AGENT: agent === "agy" ? "agy" : "claude",
-    BRANCH: branch,
-    DESCRIPTION:
-      description.trim() || "_Describe the problem: what hurts, for whom, why now._",
-    ACCEPTANCE: normalizeAcceptance(acceptance),
-  }).replace("status: draft", `status: ${state === "specced" ? "active" : "draft"}`);
+  const spec =
+    normKind === "research"
+      ? [
+          "---",
+          `title: ${cleanTitle}`,
+          "kind: research",
+          "status: active",
+          `created: ${today()}`,
+          `agents: ${normResearchAgents}`,
+          `tier: ${normTier}`,
+          "---",
+          "",
+          `# Research · ${cleanTitle}`,
+          "",
+          "## Question",
+          description.trim() || cleanTitle,
+          "",
+          "## Focus / Constraints",
+          acceptance.trim() ? normalizeAcceptance(acceptance) : "- [ ] Return cited file:line findings and a concise brief",
+          "",
+        ].join("\n")
+      : renderTemplate(template("spec.md"), {
+          TITLE: cleanTitle,
+          DATE: today(),
+          AGENT: normAgent,
+          BRANCH: branch,
+          DESCRIPTION:
+            description.trim() || "_Describe the problem: what hurts, for whom, why now._",
+          ACCEPTANCE: normalizeAcceptance(acceptance),
+        }).replace("status: draft", `status: ${state === "specced" ? "active" : "draft"}`);
 
   ensureDir(path.dirname(specPath));
   writeFileSync(specPath, spec, "utf8");
@@ -101,16 +211,33 @@ export function createTask({ projectId, title, description = "", acceptance = ""
   const ts = nowIso();
   db.prepare(
     `INSERT INTO tasks
-      (id, project_id, title, slug, state, agent, branch, spec_path, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(id, project.id, cleanTitle, slug, state, agent === "agy" ? "agy" : "claude", branch, specPath, ts, ts);
+      (id, project_id, title, slug, state, agent, kind, tier, depends_on, impl_model, review_model, research_agents, branch, spec_path, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    project.id,
+    cleanTitle,
+    slug,
+    state,
+    normAgent,
+    normKind,
+    normTier,
+    normDepends,
+    normImplModel,
+    normReviewModel,
+    normResearchAgents,
+    branch,
+    specPath,
+    ts,
+    ts,
+  );
 
   addEvent({
     taskId: id,
     actor: "you",
     type: "task.created",
-    text: `Created ${id} in ${state}`,
-    data: { project: project.name, specPath },
+    text: `Created ${id} (${normKind}/${normTier}) in ${state}`,
+    data: { project: project.name, specPath, kind: normKind, tier: normTier, dependsOn: normDepends },
   });
   syncBoard(project.id);
   bus.emit("refresh");
@@ -175,9 +302,68 @@ export function deleteTask(id) {
   return task;
 }
 
+export function getTaskUsage(taskId) {
+  const row = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(input_tokens), 0) AS input_tokens,
+         COALESCE(SUM(output_tokens), 0) AS output_tokens,
+         COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+         COALESCE(SUM(thinking_tokens), 0) AS thinking_tokens,
+         SUM(cost_usd) AS cost_usd,
+         COUNT(*) AS run_count
+       FROM runs
+       WHERE task_id = ? AND agent != 'shell'`,
+    )
+    .get(taskId);
+  const inputTokens = Number(row?.input_tokens ?? 0);
+  const outputTokens = Number(row?.output_tokens ?? 0);
+  const cacheReadTokens = Number(row?.cache_read_tokens ?? 0);
+  const thinkingTokens = Number(row?.thinking_tokens ?? 0);
+  const costUsd = row?.cost_usd === null || row?.cost_usd === undefined ? null : Number(row.cost_usd);
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    thinkingTokens,
+    totalTokens: inputTokens + outputTokens + thinkingTokens,
+    costUsd,
+    runCount: Number(row?.run_count ?? 0),
+  };
+}
+
 export function getState() {
   const projects = listProjects();
   const byId = new Map(projects.map((project) => [project.id, project]));
+
+  const usageByTask = new Map();
+  const usageRows = db
+    .prepare(
+      `SELECT task_id,
+         COALESCE(SUM(input_tokens), 0) AS input_tokens,
+         COALESCE(SUM(output_tokens), 0) AS output_tokens,
+         COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+         COALESCE(SUM(thinking_tokens), 0) AS thinking_tokens,
+         SUM(cost_usd) AS cost_usd
+       FROM runs
+       WHERE agent != 'shell'
+       GROUP BY task_id`,
+    )
+    .all();
+  for (const row of usageRows) {
+    const inputTokens = Number(row.input_tokens ?? 0);
+    const outputTokens = Number(row.output_tokens ?? 0);
+    const cacheReadTokens = Number(row.cache_read_tokens ?? 0);
+    const thinkingTokens = Number(row.thinking_tokens ?? 0);
+    usageByTask.set(row.task_id, {
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      thinkingTokens,
+      totalTokens: inputTokens + outputTokens + thinkingTokens,
+      costUsd: row.cost_usd === null || row.cost_usd === undefined ? null : Number(row.cost_usd),
+    });
+  }
 
   const hydratedProjects = projects.map((project) => {
     const rows = db
@@ -190,6 +376,7 @@ export function getState() {
       ...project,
       counts,
       active,
+      queued: counts.queued,
       blocked: counts.blocked,
       done: counts.done,
       total: Object.values(counts).reduce((sum, n) => sum + n, 0),
@@ -208,6 +395,14 @@ export function getState() {
     .map((row) => ({
       ...hydrate(row),
       projectName: byId.get(row.project_id)?.name ?? row.project_id,
+      usage: usageByTask.get(row.id) ?? {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        thinkingTokens: 0,
+        totalTokens: 0,
+        costUsd: null,
+      },
     }));
 
   return {
@@ -235,6 +430,7 @@ export function getTaskDetail(id) {
   const reviewPath = artifactsDir ? path.join(artifactsDir, "review.md") : null;
   const diffPath = artifactsDir ? path.join(artifactsDir, "diff.patch") : null;
   const testPath = artifactsDir ? path.join(artifactsDir, "test.log") : null;
+  const briefPath = artifactsDir ? path.join(artifactsDir, "brief.md") : null;
 
   const events = db
     .prepare(
@@ -259,16 +455,20 @@ export function getTaskDetail(id) {
     review: reviewPath ? readText(reviewPath) : "",
     diff: diffPath ? readText(diffPath) : "",
     test: testPath ? readText(testPath) : "",
+    brief: briefPath ? readText(briefPath) : "",
     events,
     runs,
+    usage: getTaskUsage(id),
     artifacts: {
       dir: artifactsDir,
       review: reviewPath,
       diff: diffPath,
       test: testPath,
+      brief: briefPath,
       reviewExists: reviewPath ? existsSync(reviewPath) : false,
       diffExists: diffPath ? existsSync(diffPath) : false,
       testExists: testPath ? existsSync(testPath) : false,
+      briefExists: briefPath ? existsSync(briefPath) : false,
     },
   };
 }
@@ -314,7 +514,7 @@ export function syncBoard(projectId) {
 
 _Generated by ORC · ${nowIso()}_
 
-**${counts.working + counts.review + counts.fixing + counts.verify} active · ${counts.blocked} blocked · ${counts.done} done**
+**${counts.working + counts.review + counts.fixing + counts.verify} active · ${counts.queued ?? 0} queued · ${counts.blocked} blocked · ${counts.done} done**
 
 | Task | Title | State | Agent | Branch | Updated |
 | --- | --- | --- | --- | --- | --- |
@@ -376,6 +576,15 @@ function hydrate(row) {
   if (!row) return null;
   return {
     ...row,
+    kind: normalizeKind(row.kind),
+    tier: normalizeTier(row.tier),
+    dependsOn: parseDependsOn(row.depends_on),
+    researchAgents: row.research_agents
+      ? String(row.research_agents)
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : [],
     review_loops: Number(row.review_loops ?? 0),
     projectName: resolveProject(row.project_id)?.name ?? row.project_id,
   };

@@ -81,16 +81,22 @@ Open `<repo>/docs/` directly as an **Obsidian Vault** (or link it into an existi
 
 ---
 
-## 5. Quota & Rate-Limit Management
+## 5. Quota, Tiered Models & Token Efficiency
 
-Each implement → review → fix pipeline triggers at least 2 headless CLI sessions (and up to
+Each implement → verify → review → fix pipeline triggers at least 2 headless CLI sessions (and up to
 6 sessions if it uses both fix loops):
-- **Watch quota signals:** ORC captures Claude `rate_limit_event` frames as `agent.rate_limit`
-  events and shows an amber warning banner in the task drawer.
-- **Balance quotas across vendors:** Use `--agent agy` when Claude quota is tight (Antigravity
-  implements, Claude runs read-only review), or `--agent claude` to invert.
-- **Single-CLI fallback:** Set `Reviewer policy` to `Auto` or `Same` in Project Settings (or
-  `ORC_REVIEWER=auto`) to run an isolated fresh `plan`-mode review on the available CLI when
-  one vendor hits a weekly or 5-hour limit.
-- **Pin cost/reasoning per project:** Set `Implementer model` (e.g., an orchestrator or fast
-  coding model) and `Reviewer model` (e.g., a high-reasoning model) per project in ⚙ Settings.
+- **Use `--tier low` for mechanical subtasks:** Route straightforward edits to smaller/cheaper models
+  (e.g., `sonnet` on Claude, or your `tiers.<agent>.low` slug in `orc.config.json`) while keeping
+  reviewers and your interactive Architect session on `high`-tier models.
+- **Keep compact agent-to-agent handoffs enabled (default):** ORC uses machine-dense prompts and
+  `FILE:LINE|SEV|ISSUE|FIX` review schemas internally to reduce input/output tokens. Set
+  `ORC_COMPACT_HANDOFF=0` only if you want prose-style review artifacts.
+- **Filter lockfiles with `diffIgnore`:** ORC omits lockfile and minified hunks from `diff.patch` by
+  default (prepending `git diff --stat`) so reviewers never burn context on 4,000-line lockfile diffs.
+- **Offload exploration with `orc research`:** Send `orc research <project> "<question>" --agents claude,agy --tier low --run`
+  to explore unfamiliar subsystems in read-only mode and hand back a ~40-line `brief.md`.
+- **Enable quota guardrails:** Set `ORC_PAUSE_ON_UTILIZATION=0.90` to automatically pause new/queued
+  runs when a vendor's rate-limit utilization crosses 90%, and monitor token totals in the dashboard
+  drawer and `orc status`.
+- **Balance quotas across vendors:** Use `--agent agy`, `--agent claude`, or optional `--agent codex`
+  and set `Reviewer policy` to `Auto` or `Same` in Project Settings when one vendor is near its limit.

@@ -36,6 +36,7 @@ const REQUIRED = [
   "test/orc.test.mjs",
   "test/fixtures/claude-stream.jsonl",
   "test/fixtures/agy-stream.jsonl",
+  "test/fixtures/codex-stream.jsonl",
   "docs/decisions/ADR-0001-orchestrate-official-clis.md",
   "docs/decisions/ADR-0002-worktree-merge-and-concurrency.md",
   "docs/best-practices.md",

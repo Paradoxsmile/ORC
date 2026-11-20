@@ -2,6 +2,17 @@
 
 All notable changes to ORC are documented in this file.
 
+## [0.4.0] - 2026-11-20
+
+### Added
+- **Smart diff filtering & tail-trimmed fix loops (#6):** `captureWork` excludes lockfiles and minified assets (`diffIgnore`, defaulting to `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `*.lock`, `*.min.js`, `*.min.css`) from `diff.patch` while prepending `git diff --stat` and still committing tracked changes. Fix-loop prompts now preserve `review.md` and take the **tail** of `test.log` so assertion failures are never truncated away.
+- **Tiered model routing & compact agent-to-agent handoffs:** Tasks support `--tier low|med|high` (`ORC_<AGENT>_<TIER>_MODEL` + `orc.config.json` `tiers` table, with a built-in `claude`/`low` → `sonnet` plan-saver while reviewers default to `high` tier). Agent-to-agent prompts and review output schemas use terse structured notation (`FILE:LINE|SEV|ISSUE|FIX`, `CHANGED:`, `RAN:`) by default (`ORC_COMPACT_HANDOFF=0` to disable).
+- **Token/cost telemetry & quota guardrails (#4):** SQLite `runs` schema migrates cleanly to record `model`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `thinking_tokens`, and `cost_usd` per run; surfaced in the dashboard task drawer, cards, and `orc status`. Optional `ORC_PAUSE_ON_UTILIZATION` pauses new/queued runs when a vendor's utilization reaches the threshold.
+- **Per-project task queue & `--depends-on` (#5):** Added `queued` state, `orc queue <taskId>` / `POST /api/tasks/:id/queue`, and `--depends-on T-XXXX` task chaining with automatic queue drain on `done` and `queue.halted` stops when an upstream dependency blocks.
+- **Read-only Research Mode (#2):** Added `orc research <project> "<question>" [--agents claude,agy]` (and Research type in the dashboard) running read-only in `plan` mode with no worktrees or git commits, saving Obsidian notes under `docs/research/` and a condensed executive `brief.md`.
+- **Optional OpenAI Codex CLI adapter (#3):** Added `codex` detection, `codex exec --json` argument builder (`--sandbox read-only` for plan/review, `--sandbox workspace-write --full-auto` for impl, `ORC_CODEX_YOLO=1` opt-in), JSONL stream parser + fixture (`test/fixtures/codex-stream.jsonl`), and `--agent codex` / `reviewer: codex` support.
+- **Verify-before-review pipeline (#1):** Test gate runs immediately after implementation so broken tests enter fix loops without burning reviewer tokens.
+
 ## [0.3.0] - 2026-11-19
 
 ### Added

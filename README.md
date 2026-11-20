@@ -5,9 +5,9 @@
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.5-green.svg)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](package.json)
 
-**ORC** is a local-first orchestrator that gives you **one task board across all your local Git repositories** and drives the official **Claude Code (`claude`)** and **Google Antigravity (`agy`)** CLIs headlessly in isolated Git worktrees.
+**ORC** is a local-first orchestrator that gives you **one task board across all your local Git repositories** and drives the official **Claude Code (`claude`)**, **Google Antigravity (`agy`)**, and optional **OpenAI Codex (`codex`)** CLIs headlessly in isolated Git worktrees.
 
-It owns **artifacts and processes** — specs, worktrees, diffs, review verdicts, test logs, and clean local merges — never model APIs or tokens.
+It owns **artifacts and processes** — specs, worktrees, diffs, review verdicts, test logs, research briefs, token telemetry, and clean local merges — never model APIs or tokens.
 
 > [!IMPORTANT]
 > **Please read the [Disclaimers, Rate Limits & Security](#disclaimers-rate-limits--security) section before running automated agent loops against your subscriptions.**
@@ -16,11 +16,13 @@ It owns **artifacts and processes** — specs, worktrees, diffs, review verdicts
 
 ## Why ORC?
 
-- **Separate subscriptions, zero API proxying:** `claude` keeps its login and quota; `agy` keeps its login and quota. ORC spawns the official CLIs headlessly and never stores OAuth tokens or proxies vendor traffic.
+- **Separate subscriptions, zero API proxying:** `claude`, `agy`, and optional `codex` each keep their own login and quota. ORC spawns the official CLIs headlessly and never stores OAuth tokens or proxies vendor traffic.
 - **Focused context per subtask:** Instead of dumping a 100k-token chat history into one session, each task gets a concise spec file (`docs/specs/YYYY-MM-DD-<slug>.md`) and runs in its own isolated Git worktree (`.worktrees/T-0001`).
-- **Cross-agent verification:** One CLI implements (`acceptEdits` / `accept-edits`), your test gate runs first, and once green the other CLI reviews in read-only `plan` mode, returning a machine-readable `VERDICT: APPROVE` or `VERDICT: REQUEST CHANGES` (bounded to 2 fix loops).
+- **Plan-saving model tiers & compact agent handoffs:** Mark simple/mechanical tasks `--tier low` so implementation uses smaller models (e.g. `sonnet`) while reviewers stay on `high` tier. Internal agent-to-agent prompts and review findings use terse structured notation (`FILE:LINE|SEV|ISSUE|FIX`, smart lockfile `diffIgnore`, and tail-trimmed `test.log`) to cut token waste.
+- **Read-only Research Mode (`orc research`):** Offload heavy codebase exploration to `claude` / `agy` / `codex` in read-only `plan` mode (no worktree, no edits), saving full notes to `docs/research/` and returning a ~40-line `brief.md` to your Architect session.
+- **Cross-agent verification & per-project queues:** One CLI implements, your test gate runs first, and once green the reviewer checks the diff in read-only `plan` mode (`VERDICT: APPROVE` / `REQUEST CHANGES`, max 2 fix loops). Queue follow-up tasks (`orc queue` / `--depends-on`) to drain automatically when upstream tasks finish.
 - **Zero-dependency stack:** Pure Node.js ESM (`>=22.5`, `node:sqlite`), vanilla HTML/CSS/JS dashboard with Server-Sent Events (SSE), no npm packages, no build step.
-- **Obsidian-ready memory:** Every registered repo scaffolds `AGENTS.md`, `docs/index.md`, `docs/architecture.md`, `docs/decisions/`, `docs/specs/`, and an auto-updated `docs/board.md`.
+- **Obsidian-ready memory:** Every registered repo scaffolds `AGENTS.md`, `docs/index.md`, `docs/architecture.md`, `docs/decisions/`, `docs/specs/`, `docs/research/`, and an auto-updated `docs/board.md`.
 
 ---
 
@@ -100,15 +102,16 @@ orc merge T-0001
 
 Open **`http://127.0.0.1:4317`** after running `orc serve`:
 
-- **Multi-project Kanban board:** Lanes for `Inbox`, `Ready`, `Working` (implementing/fixing), `Review` (reviewing/verifying), `Blocked`, and `Done`, updated live over SSE.
+- **Multi-project Kanban board:** Lanes for `Inbox`, `Ready` (includes `Queued`), `Working` (implementing/fixing), `Review` (reviewing/verifying), `Blocked`, and `Done`, updated live over SSE with task kind (`research`), model tier (`low`/`high`), dependency tags, and token totals on cards.
 - **Task Drawer:**
   - **Spec tab:** Edit Markdown directly with `Preview` / `Edit` toggle and `Save spec` (moves `Inbox` tasks to `Ready`).
+  - **Brief tab (Research tasks):** Rendered Markdown executive brief (`Rendered` / `Raw` toggle).
   - **Review tab:** Rendered Markdown with highlighted green/red `VERDICT` badges (`Rendered` / `Raw` toggle).
-  - **Diff tab:** Colorized unified diff with file count and `+/-` stats (`Colorized` / `Raw` toggle).
-  - **Tests & Events tabs:** Full `test.log`, run history, tool activity, and amber **Rate Limit Notice** banners when `agent.rate_limit` events fire.
-  - **Actions:** `Run`, `Stop`, `Merge`, `Open folder`, `Spec file`, `Mark done`, `Block`, `Delete`, and manual state dropdown.
-- **Project Settings (⚙ Settings):** Edit `baseBranch`, `testCommand`, `setupCommand`, `reviewer` policy (`default`, `auto`, `same`, `claude`, `agy`), `implModel`, and `reviewModel` live without restarting `orc serve`, or unregister the project.
-- **CLI Health Modal:** Click the `Claude · Antigravity · Git` indicators in the top bar to view binary paths and setup commands.
+  - **Diff tab:** Colorized unified diff with file count and `+/-` stats (`Colorized` / `Raw` toggle), with lockfiles/minified assets summarized via `diff --stat`.
+  - **Tests & Events tabs:** Full `test.log`, per-run model/token/cost telemetry, tool activity, and amber **Quota Notice** banners when `agent.rate_limit` or `run.paused_quota` events fire.
+  - **Actions:** `Run`, `Queue`, `Stop`, `Merge` (code tasks), `Open folder`, `Spec file`, `Mark done`, `Block`, `Delete`, and manual state dropdown.
+- **Project Settings (⚙ Settings):** Edit `baseBranch`, `testCommand`, `setupCommand`, `diffIgnore`, `reviewer` policy (`default`, `auto`, `same`, `claude`, `agy`, `codex`), `implModel`, and `reviewModel` live without restarting `orc serve`, or unregister the project.
+- **CLI Health Modal:** Click the `Claude · Antigravity · Codex · Git` indicators in the top bar to view binary paths and setup commands.
 
 ---
 
@@ -117,20 +120,22 @@ Open **`http://127.0.0.1:4317`** after running `orc serve`:
 | Command | Purpose |
 | :--- | :--- |
 | `orc serve [--port 4317]` | Start the local dashboard and REST/SSE API on `127.0.0.1` |
-| `orc doctor` | Check Node, Git, `claude`, `agy`, registered repos, and stale worktrees |
-| `orc project add <path> [flags]` | Register & scaffold a repo (`--name`, `--base`, `--test`, `--setup`, `--reviewer`, `--impl-model`, `--review-model`) |
+| `orc doctor` | Check Node, Git, `claude`, `agy`, optional `codex`, registered repos, and stale worktrees |
+| `orc project add <path> [flags]` | Register & scaffold a repo (`--name`, `--base`, `--test`, `--setup`, `--diff-ignore`, `--reviewer`, `--impl-model`, `--review-model`) |
 | `orc project list` | List registered projects and task counts |
 | `orc project remove <id\|name>` | Unregister a project from `orc.config.json` (leaves files on disk untouched) |
 | `orc init <project\|path>` | Write `AGENTS.md`, `docs/`, and `.gitignore` scaffold only |
-| `orc add <project> "<title>" [flags]` | Create task (`T-XXXX`), spec file, and branch name (`--desc`, `--accept`, `--agent claude\|agy`) |
-| `orc list [project]` | List tasks across all or one project |
-| `orc run <taskId>` | Run the implement → verify → review pipeline |
+| `orc add <project> "<title>" [flags]` | Create task (`T-XXXX`), spec file, and branch (`--desc`, `--accept`, `--agent claude\|agy\|codex`, `--tier low\|med\|high`, `--depends-on T-0001`, `--type code\|research`) |
+| `orc research <project> "<q>" [flags]` | Create (and with `--run`, execute) a read-only research task (`--agents claude,agy`, `--tier low\|med\|high`) |
+| `orc list [project]` | List tasks with state, tier, agent, and title |
+| `orc run <taskId>` | Run the implement → verify → review pipeline (or read-only research) |
+| `orc queue <taskId>` | Queue a task behind active project work or `--depends-on` dependencies |
 | `orc stop <taskId>` | Stop the active run (works across terminals via SQLite PID) |
 | `orc merge <taskId>` | Rebase task branch onto `baseBranch`, fast-forward, archive `.orc/`, remove worktree & branch, mark `done` |
 | `orc delete <taskId> [--clean]` | Delete task from board (`--clean` also removes its worktree & `.orc/` artifacts) |
-| `orc state <taskId> <state>` | Manually move a task (`inbox\|specced\|working\|review\|fixing\|verify\|done\|blocked`) |
+| `orc state <taskId> <state>` | Manually move a task (`inbox\|specced\|queued\|working\|review\|fixing\|verify\|done\|blocked`) |
 | `orc done <taskId>` / `orc block <taskId>` | Mark done or blocked with `--note "..."` |
-| `orc status` | Regenerate `STATUS.md` and `docs/board.md` and print board summary |
+| `orc status` | Regenerate `STATUS.md` and `docs/board.md` and print board, queue, token usage, and quota summary |
 | `orc open [task\|project]` | Open worktree, `--spec`, or `--project` in the OS file explorer |
 | `orc install` | Install global `orc` / `orc.cmd` launcher and `orc-orchestrator` skill |
 
@@ -146,13 +151,17 @@ Open **`http://127.0.0.1:4317`** after running `orc serve`:
 | `ORC_DATA_DIR` | `./data` | Override SQLite & logs directory |
 | `ORC_MAX_CONCURRENCY` | `2` | Global limit of concurrent runs across different projects |
 | `ORC_MAX_FILE_BYTES` | `5242880` (5 MiB) | Block staging/committing oversized files or binaries in `captureWork` |
-| `ORC_REVIEWER` | opposite CLI | `claude`, `agy`, `same`, or `auto` (falls back to implementer if other CLI missing) |
-| `ORC_CLAUDE_MODEL` | CLI default | Default Claude model (`ORC_CLAUDE_IMPL_MODEL` / `ORC_CLAUDE_REVIEW_MODEL` override per role) |
-| `ORC_AGY_MODEL` | CLI default | Default Antigravity model (`ORC_AGY_IMPL_MODEL` / `ORC_AGY_REVIEW_MODEL` override per role) |
-| `ORC_AGY_EFFORT` | unset | Reasoning effort (`low\|medium\|high\|xhigh\|max`; automatically omitted for Orchestrator slugs) |
+| `ORC_PAUSE_ON_UTILIZATION` | unset (off) | Pause new/queued runs for a vendor when rate-limit utilization reaches threshold (e.g., `0.90` or `90`) |
+| `ORC_COMPACT_HANDOFF` | `1` (on) | Use terse machine-dense agent-to-agent prompts and review schemas (`0` for verbose prose) |
+| `ORC_REVIEWER` | opposite CLI | `claude`, `agy`, `codex`, `same`, or `auto` (falls back if other CLIs missing) |
+| `ORC_CLAUDE_<LOW\|MED\|HIGH>_MODEL` | `low=sonnet` | Per-tier Claude model routing (reviewer defaults to `high` tier; `ORC_CLAUDE_IMPL_MODEL` / `ORC_CLAUDE_REVIEW_MODEL` / `ORC_CLAUDE_MODEL` also supported) |
+| `ORC_AGY_<LOW\|MED\|HIGH>_MODEL` | CLI default | Per-tier Antigravity model routing (`ORC_AGY_IMPL_MODEL` / `ORC_AGY_REVIEW_MODEL` / `ORC_AGY_MODEL` also supported) |
+| `ORC_CODEX_<LOW\|MED\|HIGH>_MODEL` | CLI default | Per-tier Codex model routing (`ORC_CODEX_IMPL_MODEL` / `ORC_CODEX_REVIEW_MODEL` / `ORC_CODEX_MODEL` also supported) |
+| `ORC_AGY_EFFORT` | unset | Reasoning effort (`low\|medium\|high\|xhigh\|max`; `ORC_AGY_<TIER>_EFFORT` supported; omitted for Orchestrator slugs) |
 | `ORC_AGY_YOLO` | unset (off) | Set to `1` to pass `--dangerously-skip-permissions` to Antigravity implementation runs |
+| `ORC_CODEX_YOLO` | unset (off) | Set to `1` to pass `--dangerously-bypass-approvals-and-sandbox` instead of `--full-auto` to Codex impl runs |
 
-Per-project settings configured in **⚙ Settings** (`implModel`, `reviewModel`, `reviewer`, `setupCommand`, `testCommand`, `baseBranch`) override global env defaults for that project.
+Per-project settings configured in **⚙ Settings** (`implModel`, `reviewModel`, `reviewer`, `diffIgnore`, `setupCommand`, `testCommand`, `baseBranch`) and global `tiers` in `orc.config.json` let you tune cost and reasoning cleanly without restarting ORC.
 
 ---
 

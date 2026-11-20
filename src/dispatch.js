@@ -9,13 +9,23 @@ import {
   deleteTask,
   failTask,
   getTask,
+  normalizeAgent,
+  normalizeTier,
+  parseDependsOn,
   setState,
   syncBoard,
   updateTask,
 } from "./board.js";
-import { ensureProjectGitignore, listProjects, loadConfig, removeProject, resolveProject } from "./config.js";
+import {
+  effectiveDiffIgnore,
+  ensureProjectGitignore,
+  listProjects,
+  loadConfig,
+  removeProject,
+  resolveProject,
+} from "./config.js";
 import { db, isPidAlive, reapDeadRuns } from "./db.js";
-import { ensureDir, nowIso, readText, truncate } from "./util.js";
+import { ensureDir, nowIso, readText, today, truncate, uniquePath } from "./util.js";
 
 const execFileP = promisify(execFile);
 
@@ -25,6 +35,172 @@ const AGENT_TIMEOUT_MS = 45 * 60 * 1000;
 const TEST_TIMEOUT_MS = 30 * 60 * 1000;
 
 const running = new Map();
+const vendorQuota = new Map();
+
+export function getQuotaSnapshot() {
+  return Object.fromEntries(vendorQuota.entries());
+}
+
+export function recordVendorQuota(agent, info) {
+  if (!agent || !info) return;
+  const utilization = Number.isFinite(info.utilization) ? Number(info.utilization) : null;
+  vendorQuota.set(agent, {
+    agent,
+    status: info.status || "rate_limit",
+    rateLimitType: info.rateLimitType || null,
+    utilization,
+    resetsAt: info.resetsAt ?? null,
+    updatedAt: nowIso(),
+  });
+}
+
+export function clearVendorQuota() {
+  vendorQuota.clear();
+}
+
+export function pauseThreshold(env = process.env) {
+  const raw = String(env.ORC_PAUSE_ON_UTILIZATION ?? "").trim();
+  if (!raw) return null;
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return num > 1 ? Math.min(1, num / 100) : Math.min(1, num);
+}
+
+export function checkQuotaGuardrail(agent, taskId = null, { env = process.env } = {}) {
+  const threshold = pauseThreshold(env);
+  if (threshold === null) return { paused: false };
+  const entry = vendorQuota.get(agent);
+  if (!entry || !Number.isFinite(entry.utilization)) return { paused: false };
+  if (entry.utilization < threshold) return { paused: false };
+
+  const pct = Math.round(entry.utilization * 100);
+  const limitPct = Math.round(threshold * 100);
+  const message = `Paused by quota guardrail: ${agentLabel(agent)} utilization is ${pct}% (threshold ${limitPct}%)`;
+  if (taskId) {
+    addEvent({
+      taskId,
+      actor: "orc",
+      type: "run.paused_quota",
+      text: message,
+      data: { agent, utilization: entry.utilization, threshold },
+    });
+    bus.emit("refresh");
+  }
+  return { paused: true, message, utilization: entry.utilization, threshold };
+}
+
+export function checkDependencies(task) {
+  const deps = parseDependsOn(task?.depends_on);
+  if (!deps.length) return { ok: true, deps: [], pending: [], blocked: [], missing: [] };
+  const pending = [];
+  const blocked = [];
+  const missing = [];
+  for (const depId of deps) {
+    if (depId === task.id) continue;
+    const dep = getTask(depId);
+    if (!dep) {
+      missing.push(depId);
+    } else if (dep.state === "blocked") {
+      blocked.push(depId);
+    } else if (dep.state !== "done") {
+      pending.push(depId);
+    }
+  }
+  return {
+    ok: pending.length === 0 && blocked.length === 0 && missing.length === 0,
+    deps,
+    pending,
+    blocked,
+    missing,
+  };
+}
+
+export function queueTask(taskId, { actor = "you", autoDrain = true } = {}) {
+  const task = getTask(taskId);
+  if (!task) throw new Error(`Unknown task: ${taskId}`);
+  if (running.has(taskId)) {
+    const error = new Error(`${taskId} is already running`);
+    error.status = 409;
+    throw error;
+  }
+  if (task.state === "inbox") {
+    const error = new Error(`${taskId} has no spec yet. Write the spec before queueing.`);
+    error.status = 400;
+    throw error;
+  }
+  if (task.state === "done") {
+    const error = new Error(`${taskId} is already done`);
+    error.status = 400;
+    throw error;
+  }
+
+  const updated = setState(taskId, "queued", {
+    note: task.depends_on ? `Queued (depends on ${task.depends_on})` : "Queued for project drain",
+    actor,
+  });
+  addEvent({
+    taskId,
+    actor,
+    type: "task.queued",
+    text: task.depends_on ? `Queued behind ${task.depends_on}` : "Queued",
+    data: { dependsOn: parseDependsOn(task.depends_on) },
+  });
+
+  if (autoDrain) {
+    setImmediate(() => drainQueue(task.project_id));
+  }
+  return updated;
+}
+
+export function drainQueue(projectId, { triggerRun = true } = {}) {
+  const project = resolveProject(projectId);
+  if (!project) return null;
+  if (activeTaskForProject(project.id)) return null;
+  if (running.size >= maxConcurrency()) return null;
+
+  const candidates = db
+    .prepare(
+      "SELECT * FROM tasks WHERE project_id = ? AND state = 'queued' ORDER BY created_at ASC, id ASC",
+    )
+    .all(project.id);
+
+  for (const row of candidates) {
+    const task = getTask(row.id);
+    if (!task) continue;
+    const deps = checkDependencies(task);
+    if (deps.blocked.length || deps.missing.length) {
+      const reason = deps.blocked.length
+        ? `Halted in queue: upstream dependency blocked (${deps.blocked.join(", ")})`
+        : `Halted in queue: missing dependency (${deps.missing.join(", ")})`;
+      addEvent({
+        taskId: task.id,
+        actor: "orc",
+        type: "queue.halted",
+        text: reason,
+        data: deps,
+      });
+      continue;
+    }
+    if (deps.pending.length) continue;
+
+    const quota = checkQuotaGuardrail(task.agent, task.id);
+    if (quota.paused) continue;
+
+    if (triggerRun) {
+      runTask(task.id, { actor: "queue" }).catch((error) => {
+        addEvent({
+          taskId: task.id,
+          actor: "orc",
+          type: "run.failed",
+          text: truncate(error?.message || String(error), 1200),
+        });
+        bus.emit("refresh");
+      });
+    }
+    return task;
+  }
+  return null;
+}
 
 export function runningTaskIds() {
   return [...running.keys()];
@@ -347,18 +523,23 @@ export async function removeTask(taskId, { cleanupWorktree = false, active = run
 }
 
 /**
- * Computes effective implementer, reviewer, models, and YOLO state for UI display.
+ * Computes effective implementer, reviewer, models, tier, and YOLO state for UI display.
  */
 export function taskRuntimeInfo(task, project = null) {
   const proj = project ?? resolveProject(task.project_id);
-  const implementer = task.agent === "agy" ? "agy" : "claude";
+  const implementer = normalizeAgent(task.agent);
   const reviewer = reviewerFor(implementer, { project: proj });
+  const tier = normalizeTier(task.tier);
   return {
+    kind: task.kind === "research" ? "research" : "code",
+    tier,
     implementer,
     reviewer,
-    implModel: modelFor(implementer, "impl", proj) || "default",
-    reviewModel: modelFor(reviewer, "review", proj) || "default",
+    researchAgents: task.researchAgents?.length ? task.researchAgents : [implementer],
+    implModel: modelFor(implementer, "impl", proj, task) || "default",
+    reviewModel: modelFor(reviewer, "review", proj, task) || "default",
     agyYolo: yoloFor("agy", "impl"),
+    codexYolo: yoloFor("codex", "impl"),
   };
 }
 
@@ -367,7 +548,7 @@ export function taskRuntimeInfo(task, project = null) {
  * Every externally visible step is written to the events table so the UI can
  * reconstruct what happened even after a restart.
  */
-export async function runTask(taskId, { actor = "you" } = {}) {
+export async function runTask(taskId, { actor = "you", skipDependencies = false } = {}) {
   let task = getTask(taskId);
   if (!task) throw new Error(`Unknown task: ${taskId}`);
   if (running.has(taskId)) throw new Error(`${taskId} is already running`);
@@ -383,21 +564,55 @@ export async function runTask(taskId, { actor = "you" } = {}) {
     );
   }
 
+  if (!skipDependencies) {
+    const deps = checkDependencies(task);
+    if (!deps.ok) {
+      const reasons = [];
+      if (deps.blocked.length) reasons.push(`blocked: ${deps.blocked.join(", ")}`);
+      if (deps.pending.length) reasons.push(`waiting on: ${deps.pending.join(", ")}`);
+      if (deps.missing.length) reasons.push(`missing: ${deps.missing.join(", ")}`);
+      const error = new Error(
+        `${taskId} has unmet dependencies (${reasons.join("; ")}). Queue it with "orc queue ${taskId}" or finish upstream tasks first.`,
+      );
+      error.status = 409;
+      throw error;
+    }
+  }
+
   const project = resolveProject(task.project_id);
   if (!project) throw new Error(`Project "${task.project_id}" is not registered`);
   checkConcurrency(task, project);
 
+  const implementer = normalizeAgent(task.agent);
+  const quota = checkQuotaGuardrail(implementer, task.id);
+  if (quota.paused) {
+    const error = new Error(quota.message);
+    error.status = 429;
+    error.quotaPaused = true;
+    throw error;
+  }
+
   const controller = { taskId, projectId: project.id, child: null, cancelled: false };
   running.set(taskId, controller);
+  const reviewer = reviewerFor(implementer, { project });
+  const startLabel =
+    task.kind === "research"
+      ? `Research started · ${(task.researchAgents?.length ? task.researchAgents : [implementer]).map(agentLabel).join(" + ")} (read-only)`
+      : `Pipeline started · ${agentLabel(implementer)} (${task.tier || "med"}) implements, ${agentLabel(reviewer)} reviews`;
   addEvent({
     taskId,
     actor,
     type: "run.started",
-    text: `Pipeline started · ${agentLabel(task.agent)} implements, ${agentLabel(reviewerFor(task.agent, { project }))} reviews`,
+    text: startLabel,
   });
   bus.emit("refresh");
 
   try {
+    if (task.kind === "research") {
+      await runResearchTask(task, project, controller);
+      return getTask(taskId);
+    }
+
     await provision(task, project);
 
     for (let step = 0; step < MAX_PIPELINE_STEPS; step += 1) {
@@ -407,7 +622,7 @@ export async function runTask(taskId, { actor = "you" } = {}) {
       if (task.state === "done") break;
       if (task.state === "blocked") break;
 
-      if (["specced", "working", "fixing"].includes(task.state)) {
+      if (["specced", "queued", "working", "fixing"].includes(task.state)) {
         await implementStep(task, project, controller);
       } else if (task.state === "verify") {
         await verifyStep(task, project, controller);
@@ -441,42 +656,76 @@ export async function runTask(taskId, { actor = "you" } = {}) {
     }
     return getTask(taskId);
   } finally {
+    const finished = getTask(taskId);
     running.delete(taskId);
     controller.child = null;
     bus.emit("refresh");
+    if (finished?.state === "done") {
+      setImmediate(() => drainQueue(project.id));
+    }
   }
 }
 
 export function reviewerFor(implementer, { env = process.env, health = null, project = null } = {}) {
-  const opposite = implementer === "agy" ? "claude" : "agy";
+  const normImpl = normalizeAgent(implementer);
+  const opposite = normImpl === "agy" ? "claude" : normImpl === "codex" ? "claude" : "agy";
   const override = String(project?.reviewer || env.ORC_REVIEWER || "").trim().toLowerCase();
-  if (override === "claude" || override === "agy") return override;
-  if (override === "same") return implementer === "agy" ? "agy" : "claude";
+  if (override === "claude" || override === "agy" || override === "codex") return override;
+  if (override === "same") return normImpl;
   if (override === "auto") {
     const detected = health ?? detectAgents();
-    if (detected[opposite]?.available) return opposite;
-    return implementer === "agy" ? "agy" : "claude";
+    const candidates = [opposite, "claude", "agy", "codex"].filter((a, i, arr) => arr.indexOf(a) === i);
+    for (const candidate of candidates) {
+      if (candidate !== normImpl && detected[candidate]?.available) return candidate;
+    }
+    return normImpl;
   }
   return opposite;
 }
 
-export function modelFor(agent, role, project = null) {
+export function modelFor(agent, role, project = null, task = null, { env = process.env } = {}) {
+  const normAgent = normalizeAgent(agent);
+  const effectiveTier = role === "review" ? "high" : normalizeTier(task?.tier);
+
+  const taskModel = String(role === "review" ? task?.review_model ?? "" : task?.impl_model ?? "").trim();
+  if (taskModel) return taskModel;
+
   const projectModel = String(role === "review" ? project?.reviewModel ?? "" : project?.implModel ?? "").trim();
   if (projectModel) return projectModel;
-  if (agent === "agy") {
-    const specific = role === "review" ? "ORC_AGY_REVIEW_MODEL" : "ORC_AGY_IMPL_MODEL";
-    return process.env[specific] || process.env.ORC_AGY_MODEL || null;
+
+  const prefix = normAgent === "agy" ? "ORC_AGY" : normAgent === "codex" ? "ORC_CODEX" : "ORC_CLAUDE";
+  const tierKey = `${prefix}_${effectiveTier.toUpperCase()}_MODEL`;
+  if (env[tierKey]) return env[tierKey];
+
+  const roleKey = role === "review" ? `${prefix}_REVIEW_MODEL` : `${prefix}_IMPL_MODEL`;
+  if (env[roleKey]) return env[roleKey];
+
+  const configTierModel = String(loadConfig()?.tiers?.[normAgent]?.[effectiveTier] ?? "").trim();
+  if (configTierModel) return configTierModel;
+
+  if (env[`${prefix}_MODEL`]) return env[`${prefix}_MODEL`];
+
+  // Built-in plan-saver: when a task is explicitly marked tier=low on Claude,
+  // route implementation to Sonnet unless disabled via ORC_TIER_DEFAULTS=0.
+  if (
+    normAgent === "claude" &&
+    role !== "review" &&
+    task?.tier === "low" &&
+    env.ORC_TIER_DEFAULTS !== "0"
+  ) {
+    return "sonnet";
   }
-  const specific = role === "review" ? "ORC_CLAUDE_REVIEW_MODEL" : "ORC_CLAUDE_IMPL_MODEL";
-  return process.env[specific] || process.env.ORC_CLAUDE_MODEL || null;
+
+  return null;
 }
 
-export function effortFor(agent, role, project = null) {
+export function effortFor(agent, role, project = null, task = null, { env = process.env } = {}) {
   if (agent !== "agy") return null;
-  const model = modelFor(agent, role, project);
+  const model = modelFor(agent, role, project, task, { env });
   // Orchestrator uses a fixed configuration and rejects --effort.
   if (model && model.includes("orchestrator")) return null;
-  return process.env.ORC_AGY_EFFORT || null;
+  const effectiveTier = role === "review" ? "high" : normalizeTier(task?.tier);
+  return env[`ORC_AGY_${effectiveTier.toUpperCase()}_EFFORT`] || env.ORC_AGY_EFFORT || null;
 }
 
 export function maxTrackedFileBytes() {
@@ -486,14 +735,193 @@ export function maxTrackedFileBytes() {
 }
 
 export function yoloFor(agent, role) {
-  if (agent !== "agy" || role !== "impl") return false;
-  return /^(1|true|yes)$/i.test(String(process.env.ORC_AGY_YOLO ?? "").trim());
+  if (role !== "impl") return false;
+  if (agent === "agy") return /^(1|true|yes)$/i.test(String(process.env.ORC_AGY_YOLO ?? "").trim());
+  if (agent === "codex") return /^(1|true|yes)$/i.test(String(process.env.ORC_CODEX_YOLO ?? "").trim());
+  return false;
+}
+
+export function compactHandoff(env = process.env) {
+  return String(env.ORC_COMPACT_HANDOFF ?? "1").trim() !== "0";
 }
 
 function cancelledError() {
   const error = new Error("Stopped by user");
   error.cancelled = true;
   return error;
+}
+
+async function runResearchTask(task, project, controller) {
+  ensureProjectGitignore(project);
+  const artifactsDir = path.join(project.path, ".orc", task.id);
+  const researchDir = path.join(project.path, "docs", "research");
+  ensureDir(artifactsDir);
+  ensureDir(researchDir);
+
+  const sourceSpec = task.spec_path ? readText(task.spec_path, "") : `# ${task.title}\n`;
+  writeFileSync(path.join(artifactsDir, "spec.md"), sourceSpec, "utf8");
+
+  setState(task.id, "working", { note: "Read-only research started", actor: "orc" });
+
+  const agents = task.researchAgents?.length ? task.researchAgents : [normalizeAgent(task.agent)];
+  const outputs = [];
+
+  for (const agent of agents) {
+    if (controller.cancelled) throw cancelledError();
+    const quota = checkQuotaGuardrail(agent, task.id);
+    if (quota.paused) throw new Error(quota.message);
+
+    const promptFile = `prompt-research-${agent}.md`;
+    const prompt = buildResearchPrompt(task, project, agent);
+    writeFileSync(path.join(artifactsDir, promptFile), prompt, "utf8");
+    const cliPrompt = `Read and follow .orc/${task.id}/${promptFile}. Read-only mode: do not edit files or run shell commands.`;
+
+    const model = modelFor(agent, "research", project, task);
+    const runId = startRun(task.id, agent, "research", model);
+    addEvent({
+      taskId: task.id,
+      runId,
+      actor: agent,
+      type: "agent.prompt",
+      text: `Researching (${agentLabel(agent)}, read-only)`,
+      data: { prompt: path.join(artifactsDir, promptFile), model: model || "default" },
+    });
+
+    const coalescer = createEventCoalescer(task.id, runId, agent);
+    let result;
+    try {
+      result = await runAgent({
+        agent,
+        prompt: cliPrompt,
+        cwd: project.path,
+        mode: "plan",
+        model,
+        effort: effortFor(agent, "research", project, task),
+        timeoutMs: AGENT_TIMEOUT_MS,
+        taskId: task.id,
+        runId,
+        onSpawn: (child) => {
+          controller.child = child;
+          setRunPid(runId, child.pid);
+        },
+        onEvent: (event) => coalescer.push(event),
+      });
+    } catch (error) {
+      coalescer.flush();
+      controller.child = null;
+      finishRun(runId, { code: -1, error: error.message });
+      throw error;
+    }
+    coalescer.flush();
+    controller.child = null;
+    finishRun(runId, result, controller.cancelled);
+    if (result.rateLimit) recordVendorQuota(agent, result.rateLimit);
+    if (controller.cancelled) throw cancelledError();
+
+    if (result.code !== 0 || result.error) {
+      throw new Error(
+        `${agentLabel(agent)} research failed (exit ${result.code})${result.error ? `: ${result.error}` : ""}\n${tail(result.text, 1500)}`,
+      );
+    }
+
+    const noteHeader = [
+      "---",
+      `task: ${task.id}`,
+      `title: ${task.title}`,
+      `agent: ${agent}`,
+      `date: ${today()}`,
+      "kind: research-note",
+      "---",
+      "",
+    ].join("\n");
+    const noteBody = `${noteHeader}${result.text.trim()}\n`;
+    const artifactNote = path.join(artifactsDir, `research-${agent}.md`);
+    const docNote = uniquePath(path.join(researchDir, `${today()}-${task.slug}-${agent}.md`));
+    writeFileSync(artifactNote, noteBody, "utf8");
+    writeFileSync(docNote, noteBody, "utf8");
+    outputs.push({ agent, text: result.text.trim(), artifactNote, docNote });
+  }
+
+  if (controller.cancelled) throw cancelledError();
+
+  let briefText = "";
+  if (outputs.length === 1) {
+    briefText = outputs[0].text;
+  } else {
+    const synthAgent = reviewerFor(agents[0], { project });
+    const synthModel = modelFor(synthAgent, "review", project, task);
+    const synthPromptFile = "prompt-research-brief.md";
+    const synthPrompt = buildResearchSynthesisPrompt(task, project, outputs);
+    writeFileSync(path.join(artifactsDir, synthPromptFile), synthPrompt, "utf8");
+    const runId = startRun(task.id, synthAgent, "synthesize", synthModel);
+    const coalescer = createEventCoalescer(task.id, runId, synthAgent);
+
+    let synthResult = null;
+    try {
+      synthResult = await runAgent({
+        agent: synthAgent,
+        prompt: `Read and follow .orc/${task.id}/${synthPromptFile}. Read-only mode: do not edit files or run shell commands.`,
+        cwd: project.path,
+        mode: "plan",
+        model: synthModel,
+        effort: effortFor(synthAgent, "review", project, task),
+        timeoutMs: AGENT_TIMEOUT_MS,
+        taskId: task.id,
+        runId,
+        onSpawn: (child) => {
+          controller.child = child;
+          setRunPid(runId, child.pid);
+        },
+        onEvent: (event) => coalescer.push(event),
+      });
+      coalescer.flush();
+      controller.child = null;
+      finishRun(runId, synthResult, controller.cancelled);
+      if (synthResult.rateLimit) recordVendorQuota(synthAgent, synthResult.rateLimit);
+      if (synthResult.code === 0 && !synthResult.error && synthResult.text.trim()) {
+        briefText = synthResult.text.trim();
+      }
+    } catch {
+      coalescer.flush();
+      controller.child = null;
+      finishRun(runId, { code: -1, error: "Synthesis fallback used" });
+    }
+    if (controller.cancelled) throw cancelledError();
+
+    if (!briefText) {
+      briefText = outputs
+        .map((item) => `## ${agentLabel(item.agent)}\n${truncate(item.text, 2200)}`)
+        .join("\n\n");
+    }
+  }
+
+  const briefHeader = [
+    "---",
+    `task: ${task.id}`,
+    `title: ${task.title}`,
+    `agents: ${agents.join(",")}`,
+    `date: ${today()}`,
+    "kind: research-brief",
+    "---",
+    "",
+    `# Brief · ${task.id} ${task.title}`,
+    "",
+  ].join("\n");
+  const briefContent = `${briefHeader}${briefText.trim()}\n`;
+  const artifactBrief = path.join(artifactsDir, "brief.md");
+  const docBrief = uniquePath(path.join(researchDir, `${today()}-${task.slug}-brief.md`));
+  writeFileSync(artifactBrief, briefContent, "utf8");
+  writeFileSync(docBrief, briefContent, "utf8");
+
+  updateTask(task.id, { last_error: null });
+  addEvent({
+    taskId: task.id,
+    actor: "orc",
+    type: "research.completed",
+    text: `Brief written (${briefContent.split("\n").length} lines) → ${path.relative(project.path, docBrief).replaceAll("\\", "/")}`,
+    data: { brief: docBrief, notes: outputs.map((o) => o.docNote) },
+  });
+  setState(task.id, "done", { note: "Research brief ready", actor: "orc" });
 }
 
 async function provision(task, project) {
@@ -602,7 +1030,7 @@ async function provision(task, project) {
 }
 
 async function implementStep(task, project, controller) {
-  const { worktree, artifactsDir, base } = await provision(task, project);
+  const { worktree, artifactsDir } = await provision(task, project);
   const fixing = task.state === "fixing";
   const label = fixing ? "fix" : "implementation";
 
@@ -613,8 +1041,9 @@ async function implementStep(task, project, controller) {
 
   const sessionId = task.session_id || null;
   const prompt = buildImplementPrompt(task, project, { fixing, worktree });
-  const implementer = task.agent === "agy" ? "agy" : "claude";
-  const runId = startRun(task.id, implementer, label);
+  const implementer = normalizeAgent(task.agent);
+  const implModel = modelFor(implementer, "impl", project, task);
+  const runId = startRun(task.id, implementer, label, implModel);
 
   const promptFile = fixing
     ? `prompt-fix-${Number(task.review_loops ?? 0) || 1}.md`
@@ -624,8 +1053,8 @@ async function implementStep(task, project, controller) {
     runId,
     actor: implementer,
     type: "agent.prompt",
-    text: fixing ? "Fixing review findings" : "Implementing the spec",
-    data: { prompt: path.join(artifactsDir, promptFile) },
+    text: fixing ? "Fixing review findings" : `Implementing spec (${task.tier || "med"}${implModel ? ` · ${implModel}` : ""})`,
+    data: { prompt: path.join(artifactsDir, promptFile), model: implModel || "default" },
   });
   writeFileSync(path.join(artifactsDir, promptFile), prompt, "utf8");
   if (promptFile !== "prompt-implement.md") {
@@ -639,7 +1068,7 @@ async function implementStep(task, project, controller) {
     fixFiles.push(`.orc/${task.id}/test.log`);
   }
   const cliPrompt = fixing
-    ? `Tests failed or the reviewer requested changes. Read ${fixFiles.join(", ")}, then apply the requested fixes in this worktree.`
+    ? `Tests failed or reviewer requested changes. Read ${fixFiles.join(", ")}, apply fixes in this worktree.`
     : `Read and follow .orc/${task.id}/prompt-implement.md in this worktree.`;
 
   const before = (await git(worktree, ["rev-parse", "HEAD"], { allowFailure: true })).stdout.trim();
@@ -653,8 +1082,8 @@ async function implementStep(task, project, controller) {
       cwd: worktree,
       sessionId,
       mode: implementer === "agy" ? "accept-edits" : null,
-      model: modelFor(implementer, "impl", project),
-      effort: effortFor(implementer, "impl", project),
+      model: implModel,
+      effort: effortFor(implementer, "impl", project, task),
       yolo: yoloFor(implementer, "impl"),
       timeoutMs: AGENT_TIMEOUT_MS,
       taskId: task.id,
@@ -675,6 +1104,7 @@ async function implementStep(task, project, controller) {
 
   controller.child = null;
   finishRun(runId, result, controller.cancelled);
+  if (result.rateLimit) recordVendorQuota(implementer, result.rateLimit);
   if (controller.cancelled) throw cancelledError();
 
   if (result.sessionId && result.sessionId !== task.session_id) {
@@ -687,7 +1117,7 @@ async function implementStep(task, project, controller) {
     );
   }
 
-  const { patch, head } = await captureWork(worktree, task, project, label, before);
+  const { patch, head, omittedFiles } = await captureWork(worktree, task, project, label, before);
   writeFileSync(path.join(artifactsDir, "diff.patch"), patch, "utf8");
 
   if (!patch.trim() || head === before) {
@@ -701,8 +1131,8 @@ async function implementStep(task, project, controller) {
     runId,
     actor: "orc",
     type: "diff.captured",
-    text: `${patch.split("\n").length} lines of diff`,
-    data: { head },
+    text: `${patch.split("\n").length} lines of diff${omittedFiles?.length ? ` (${omittedFiles.length} ignored file(s) stat-only)` : ""}`,
+    data: { head, omittedFiles: omittedFiles ?? [] },
   });
 
   const hasTest = Boolean(String(project.testCommand ?? "").trim());
@@ -718,17 +1148,22 @@ async function reviewStep(task, project, controller) {
   if (!task.worktree) throw new Error("Task has no worktree; run the implementation step first.");
   const artifactsDir = path.join(task.worktree, ".orc", task.id);
   const reviewer = reviewerFor(task.agent, { project });
+  const quota = checkQuotaGuardrail(reviewer, task.id);
+  if (quota.paused) throw new Error(quota.message);
+
   const prompt = buildReviewPrompt(task, project);
   writeFileSync(path.join(artifactsDir, "prompt-review.md"), prompt, "utf8");
   const cliPrompt = `Read and follow .orc/${task.id}/prompt-review.md in this worktree.`;
 
-  const runId = startRun(task.id, reviewer, "review");
+  const reviewModel = modelFor(reviewer, "review", project, task);
+  const runId = startRun(task.id, reviewer, "review", reviewModel);
   addEvent({
     taskId: task.id,
     runId,
     actor: reviewer,
     type: "agent.prompt",
-    text: "Reviewing the diff against the spec",
+    text: `Reviewing diff (${reviewModel || "default"})`,
+    data: { model: reviewModel || "default" },
   });
 
   const coalescer = createEventCoalescer(task.id, runId, reviewer);
@@ -739,8 +1174,8 @@ async function reviewStep(task, project, controller) {
       prompt: cliPrompt,
       cwd: task.worktree,
       mode: "plan",
-      model: modelFor(reviewer, "review", project),
-      effort: effortFor(reviewer, "review", project),
+      model: reviewModel,
+      effort: effortFor(reviewer, "review", project, task),
       timeoutMs: AGENT_TIMEOUT_MS,
       taskId: task.id,
       runId,
@@ -760,6 +1195,7 @@ async function reviewStep(task, project, controller) {
 
   controller.child = null;
   finishRun(runId, result, controller.cancelled);
+  if (result.rateLimit) recordVendorQuota(reviewer, result.rateLimit);
   if (controller.cancelled) throw cancelledError();
 
   if (result.sessionId) updateTask(task.id, { conversation_id: result.sessionId });
@@ -774,7 +1210,7 @@ async function reviewStep(task, project, controller) {
   const header = [
     `# Review · ${task.id} ${task.title}`,
     "",
-    `- Reviewer: ${agentLabel(reviewer)}`,
+    `- Reviewer: ${agentLabel(reviewer)}${reviewModel ? ` (${reviewModel})` : ""}`,
     `- At: ${nowIso()}`,
     `- Verdict: ${verdict ?? "missing"}`,
     "",
@@ -899,38 +1335,70 @@ async function verifyStep(task, project, controller) {
   }
 }
 
-function buildImplementPrompt(task, project, { fixing, worktree }) {
+export function formatFixContext(reviewText, testText, { reviewMax = 6000, testMax = 3000 } = {}) {
+  const sections = [];
+  const cleanReview = String(reviewText ?? "").trim();
+  const cleanTest = String(testText ?? "").trim();
+
+  if (cleanReview) {
+    sections.push(`### review.md\n${truncate(cleanReview, reviewMax)}`);
+  }
+  if (cleanTest) {
+    const trimmedTest =
+      cleanTest.length > testMax
+        ? `[...earlier test output trimmed...]\n${cleanTest.slice(-testMax)}`
+        : cleanTest;
+    sections.push(`### test.log (tail)\n${trimmedTest}`);
+  }
+  return sections.join("\n\n");
+}
+
+export function buildImplementPrompt(task, project, { fixing, worktree }) {
   const artifacts = `.orc/${task.id}`;
-  const testCommand = project.testCommand || "(no test command configured)";
-  const lines = [
-    `# Task ${task.id} — ${task.title}`,
-    "",
-    `Project: ${project.name}`,
-    `Worktree: ${worktree}`,
-    `Read first: ${artifacts}/spec.md`,
-    "Then read AGENTS.md. Open only the files the task actually needs.",
-    "",
-    "## Job",
-    fixing
-      ? "Address the reviewer's findings below. Fix causes, not symptoms. Re-run the relevant checks."
-      : "Implement the spec in this worktree. Stay inside its acceptance criteria and constraints.",
-    "",
-    "## Rules",
-    "- Work only inside this worktree. Do not touch the main checkout.",
-    "- Do not edit anything under .orc/ except the spec copy if the task requires it.",
-    "- Do not commit; ORC records the diff and commits it for review.",
-    "- If the task is ambiguous, make the smallest reasonable choice and note it.",
-    `- Test command: ${testCommand}`,
-    "",
-    "## Finish",
-    "End with at most 10 lines: what changed, what you ran, and any open question.",
-  ];
+  const testCommand = project.testCommand || "none";
+  const compact = compactHandoff();
+
+  const lines = compact
+    ? [
+        `TASK:${task.id}|${task.title}|TIER:${task.tier || "med"}`,
+        `REPO:${project.name}|WT:${worktree}`,
+        `READ:${artifacts}/spec.md, AGENTS.md (open only needed files)`,
+        `MODE:${fixing ? "FIX(root-cause findings/test-fail; re-run checks)" : "IMPL(strict AC+constraints)"}`,
+        `RULES:wt-only; no-.orc-edits; no-git-commit; smallest-safe-choice-if-ambiguous; TEST=${testCommand}`,
+        `OUT:<=6 lines, zero filler prose. Format:`,
+        `CHANGED:<comma-separated files>`,
+        `RAN:<cmd:ok|fail>`,
+        `OPEN:<none or blocker>`,
+      ]
+    : [
+        `# Task ${task.id} — ${task.title}`,
+        "",
+        `Project: ${project.name}`,
+        `Worktree: ${worktree}`,
+        `Read first: ${artifacts}/spec.md`,
+        "Then read AGENTS.md. Open only the files the task actually needs.",
+        "",
+        "## Job",
+        fixing
+          ? "Address the reviewer's findings below. Fix causes, not symptoms. Re-run the relevant checks."
+          : "Implement the spec in this worktree. Stay inside its acceptance criteria and constraints.",
+        "",
+        "## Rules",
+        "- Work only inside this worktree. Do not touch the main checkout.",
+        "- Do not edit anything under .orc/ except the spec copy if the task requires it.",
+        "- Do not commit; ORC records the diff and commits it for review.",
+        "- If the task is ambiguous, make the smallest reasonable choice and note it.",
+        `- Test command: ${testCommand}`,
+        "",
+        "## Finish",
+        "End with at most 10 lines: what changed, what you ran, and any open question.",
+      ];
 
   if (fixing) {
     const review = readText(path.join(worktree, ".orc", task.id, "review.md"), "");
     const test = readText(path.join(worktree, ".orc", task.id, "test.log"), "");
-    const context = [review, test].filter((value) => value.trim()).join("\n\n");
-    lines.push("", "## Findings to address", "", truncate(context, 9000) || "(none recorded)");
+    const context = formatFixContext(review, test);
+    lines.push("", "## Findings", "", context || "(none recorded)");
   }
 
   return `${lines.join("\n")}\n`;
@@ -939,6 +1407,28 @@ function buildImplementPrompt(task, project, { fixing, worktree }) {
 export function buildReviewPrompt(task, project) {
   const artifacts = `.orc/${task.id}`;
   const hasTestLog = Boolean(task.worktree && existsSync(path.join(task.worktree, ".orc", task.id, "test.log")));
+  const compact = compactHandoff();
+
+  if (compact) {
+    const lines = [
+      `REVIEW:${task.id}|${task.title}|REPO:${project.name}`,
+      "ROLE:read-only-reviewer. Do not modify files. Do not run shell commands (file-read tools only).",
+      "READ:",
+      `- Spec: ${artifacts}/spec.md`,
+      `- Diff: ${artifacts}/diff.patch`,
+      ...(hasTestLog ? [`- Test log: ${artifacts}/test.log`] : []),
+      `- Meta: ${artifacts}/task.json`,
+      "- AGENTS.md (rules check)",
+      "CHECK:every AC met | diff scoped (no secrets/noise) | tests adequate | edge-cases/regressions",
+      "OUT:terse machine-dense; zero prose or diff restatement; max 15 lines.",
+      "FINDINGS format (omit if clean): `FILE:LINE|SEV(high|med|low)|ISSUE|FIX`",
+      "FINAL LINE exact:",
+      "VERDICT: APPROVE",
+      "VERDICT: REQUEST CHANGES",
+    ];
+    return `${lines.join("\n")}\n`;
+  }
+
   const lines = [
     `# Review ${task.id} — ${task.title}`,
     "",
@@ -967,6 +1457,36 @@ export function buildReviewPrompt(task, project) {
     "VERDICT: REQUEST CHANGES",
   ];
   return `${lines.join("\n")}\n`;
+}
+
+export function buildResearchPrompt(task, project, agent) {
+  const artifacts = `.orc/${task.id}`;
+  return [
+    `RESEARCH:${task.id}|${task.title}|REPO:${project.name}|AGENT:${agent}`,
+    "ROLE:read-only codebase researcher. Do not modify files. Do not run shell commands.",
+    `READ:${artifacts}/spec.md, AGENTS.md, then only relevant files.`,
+    "OUT:dense agent-handoff brief (<=45 lines, zero filler prose, cite exact file:line).",
+    "SECTIONS:",
+    "## SUMMARY (<=5 bullets, facts only)",
+    "## REFS (`path:line|symbol|role`)",
+    "## CONSTRAINTS (invariants, configs, edge cases)",
+    "## RISKS (gotchas, coupling, breaking areas)",
+    "## SUBTASKS (ordered candidate ORC subtasks with target files)",
+  ].join("\n") + "\n";
+}
+
+function buildResearchSynthesisPrompt(task, project, outputs) {
+  const artifacts = `.orc/${task.id}`;
+  const files = outputs.map((o) => `- ${artifacts}/research-${o.agent}.md`).join("\n");
+  return [
+    `SYNTH:${task.id}|${task.title}|REPO:${project.name}`,
+    "ROLE:read-only research synthesizer. Do not modify files. Do not run shell commands.",
+    "READ:",
+    `- ${artifacts}/spec.md`,
+    files,
+    "TASK:Merge and deduplicate findings into ONE compact executive brief (<=45 lines, zero filler).",
+    "SECTIONS: SUMMARY | REFS (`path:line|symbol|role`) | CONSTRAINTS | RISKS | SUBTASKS",
+  ].join("\n") + "\n";
 }
 
 export function parseVerdict(text) {
@@ -1027,16 +1547,65 @@ export async function captureWork(worktree, task, project, label, before) {
   }
 
   const head = (await git(worktree, ["rev-parse", "HEAD"])).stdout.trim();
-  const diff = await git(worktree, ["diff", `${base}...HEAD`], { maxBuffer: 32 * 1024 * 1024 });
-  return { patch: diff.stdout, head, before };
+  const ignorePatterns = effectiveDiffIgnore(project);
+  const excludes = ignorePatterns.map((pattern) => `:(exclude)${pattern}`);
+
+  const allChangedRes = await git(worktree, ["diff", "--name-only", `${base}...HEAD`], {
+    allowFailure: true,
+  });
+  const allChanged = allChangedRes.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  let patch = "";
+  let omittedFiles = [];
+
+  if (excludes.length && allChanged.length) {
+    const keptNamesRes = await git(
+      worktree,
+      ["diff", "--name-only", `${base}...HEAD`, "--", ".", ...excludes],
+      { allowFailure: true },
+    );
+    const keptSet = new Set(
+      keptNamesRes.stdout
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean),
+    );
+    omittedFiles = allChanged.filter((file) => !keptSet.has(file));
+
+    const filteredDiff = await git(
+      worktree,
+      ["diff", `${base}...HEAD`, "--", ".", ...excludes],
+      { maxBuffer: 32 * 1024 * 1024 },
+    );
+
+    if (omittedFiles.length) {
+      const statRes = await git(worktree, ["diff", "--stat", `${base}...HEAD`], { allowFailure: true });
+      const header = [
+        `# diff --stat (omitted from patch via diffIgnore: ${omittedFiles.join(", ")})`,
+        statRes.stdout.trim(),
+        "",
+      ].join("\n");
+      patch = filteredDiff.stdout.trim() ? `${header}${filteredDiff.stdout}` : `${header}`;
+    } else {
+      patch = filteredDiff.stdout;
+    }
+  } else {
+    const diff = await git(worktree, ["diff", `${base}...HEAD`], { maxBuffer: 32 * 1024 * 1024 });
+    patch = diff.stdout;
+  }
+
+  return { patch, head, before, omittedFiles };
 }
 
-function startRun(taskId, agent, step) {
+function startRun(taskId, agent, step, model = null) {
   const runId = `R-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   db.prepare(
-    `INSERT INTO runs (id, task_id, agent, step, status, started_at)
-     VALUES (?, ?, ?, ?, 'running', ?)`,
-  ).run(runId, taskId, agent, step, nowIso());
+    `INSERT INTO runs (id, task_id, agent, step, model, status, started_at)
+     VALUES (?, ?, ?, ?, ?, 'running', ?)`,
+  ).run(runId, taskId, agent, step, model || null, nowIso());
   return runId;
 }
 
@@ -1050,10 +1619,21 @@ function setRunPid(runId, pid) {
 
 function finishRun(runId, result, cancelled = false) {
   const status = cancelled ? "stopped" : result.code === 0 && !result.error ? "ok" : "failed";
-  db.prepare("UPDATE runs SET status = ?, ended_at = ?, exit_code = ? WHERE id = ?").run(
+  const usage = result.usage ?? null;
+  db.prepare(
+    `UPDATE runs
+     SET status = ?, ended_at = ?, exit_code = ?,
+         input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, thinking_tokens = ?, cost_usd = ?
+     WHERE id = ?`,
+  ).run(
     status,
     nowIso(),
     result.code ?? null,
+    usage?.inputTokens || null,
+    usage?.outputTokens || null,
+    usage?.cacheReadTokens || null,
+    usage?.thinkingTokens || null,
+    usage?.costUsd ?? null,
     runId,
   );
 }
@@ -1101,6 +1681,9 @@ export function createEventCoalescer(
 
 function recordAgentEvent(taskId, runId, agent, event) {
   const kind = event.kind || "event";
+  if (kind === "rate_limit" && event.data) {
+    recordVendorQuota(agent, event.data);
+  }
   if (kind === "init") {
     addEvent({
       taskId,

@@ -1,4 +1,22 @@
 {
   "port": 4317,
+  "maxConcurrency": 2,
+  "tiers": {
+    "claude": {
+      "low": "sonnet",
+      "med": "sonnet",
+      "high": "opus"
+    },
+    "agy": {
+      "low": "",
+      "med": "",
+      "high": ""
+    },
+    "codex": {
+      "low": "",
+      "med": "",
+      "high": ""
+    }
+  },
   "projects": []
 }

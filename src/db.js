@@ -61,6 +61,33 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
 `);
 
+function ensureColumns(table, definitions) {
+  const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name));
+  for (const [column, spec] of definitions) {
+    if (!existing.has(column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${spec};`);
+    }
+  }
+}
+
+ensureColumns("tasks", [
+  ["kind", "TEXT NOT NULL DEFAULT 'code'"],
+  ["tier", "TEXT NOT NULL DEFAULT 'med'"],
+  ["depends_on", "TEXT"],
+  ["impl_model", "TEXT"],
+  ["review_model", "TEXT"],
+  ["research_agents", "TEXT"],
+]);
+
+ensureColumns("runs", [
+  ["model", "TEXT"],
+  ["input_tokens", "INTEGER"],
+  ["output_tokens", "INTEGER"],
+  ["cache_read_tokens", "INTEGER"],
+  ["thinking_tokens", "INTEGER"],
+  ["cost_usd", "REAL"],
+]);
+
 export function nextTaskId() {
   const row = db
     .prepare("SELECT COALESCE(MAX(CAST(SUBSTR(id, 3) AS INTEGER)), 0) AS n FROM tasks")

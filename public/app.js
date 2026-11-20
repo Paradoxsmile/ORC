@@ -1,8 +1,9 @@
-const STATES = ["inbox", "specced", "working", "review", "fixing", "verify", "done", "blocked"];
+const STATES = ["inbox", "specced", "queued", "working", "review", "fixing", "verify", "done", "blocked"];
 
 const STATE_LABEL = {
   inbox: "Inbox",
   specced: "Ready",
+  queued: "Queued",
   working: "Working",
   review: "Review",
   fixing: "Fixing",
@@ -13,7 +14,7 @@ const STATE_LABEL = {
 
 const LANES = [
   { id: "inbox", label: "Inbox", states: ["inbox"] },
-  { id: "specced", label: "Ready", states: ["specced"] },
+  { id: "specced", label: "Ready", states: ["specced", "queued"] },
   { id: "working", label: "Working", states: ["working", "fixing"] },
   { id: "review", label: "Review", states: ["review", "verify"] },
   { id: "blocked", label: "Blocked", states: ["blocked"] },
@@ -23,6 +24,7 @@ const LANES = [
 const COMMANDS = {
   claude: "Claude",
   agy: "Antigravity",
+  codex: "Codex",
 };
 
 const ui = {
@@ -36,15 +38,21 @@ const ui = {
   specDirty: false,
   specPreview: false,
   reviewRaw: false,
+  briefRaw: false,
   diffRaw: false,
 };
 
 const MODEL_SUGGESTIONS = [
+  "sonnet",
+  "opus",
+  "haiku",
   "gemini-pro-orchestrator-argon",
   "gemini-4-argon-high",
   "gemini-4-hydrogen-xhigh",
   "claude-sonnet-5-5",
   "claude-opus-5-5",
+  "o4-mini",
+  "gpt-5-codex",
 ];
 
 let stateTimer = null;
@@ -205,18 +213,27 @@ function render() {
   renderSideFoot();
 }
 
+function formatTokens(count) {
+  const n = Number(count ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
 function renderHealth() {
   const health = ui.data?.health ?? {};
   const items = [
     ["claude", "Claude"],
     ["agy", "Antigravity"],
+    ["codex", "Codex"],
     ["git", "Git"],
   ];
   const pills = items
     .map(([key, label]) => {
       const entry = health[key];
       const ok = Boolean(entry?.available);
-      const title = entry?.path || "Not found on PATH";
+      const title = entry?.path || (key === "codex" ? "Optional — not found on PATH" : "Not found on PATH");
       return `<span class="${ok ? "ok" : "off"}" title="${esc(title)}"><i></i>${label}</span>`;
     })
     .join("");
@@ -369,6 +386,11 @@ function renderCard(task, isRunning) {
   const loop = Number(task.review_loops ?? 0);
   const loopLabel = loop ? ` · loop ${loop}/2` : "";
   const lastEvent = task.last_event ? ` · ${task.last_event}` : "";
+  const tokLabel = formatTokens(task.usage?.totalTokens);
+  const isResearch = task.kind === "research";
+  const tierTag = task.tier && task.tier !== "med" ? `<span class="mini-tag tier-${esc(task.tier)}">${esc(task.tier)}</span>` : "";
+  const kindTag = isResearch ? '<span class="mini-tag research">research</span>' : "";
+  const depTag = task.depends_on ? `<span class="mini-tag dep" title="Depends on ${esc(task.depends_on)}">after ${esc(task.depends_on)}</span>` : "";
   return `
     <article class="card state-${esc(task.state)}" role="button" tabindex="0"
       data-task-id="${esc(task.id)}"
@@ -376,7 +398,7 @@ function renderCard(task, isRunning) {
       title="${esc(truncate(`${task.title}${lastEvent}`, 220))}">
       <div class="card-top">
         <span class="task-id">${esc(task.id)}</span>
-        <span class="state-pill ${esc(task.state)}">${esc(STATE_LABEL[task.state] ?? task.state)}</span>
+        <span class="card-badges">${kindTag}${tierTag}<span class="state-pill ${esc(task.state)}">${esc(STATE_LABEL[task.state] ?? task.state)}</span></span>
       </div>
       <h3>${esc(task.title)}</h3>
       <div class="card-meta">
@@ -384,10 +406,12 @@ function renderCard(task, isRunning) {
         <span class="project-name">${esc(task.projectName)}</span>
         <span>·</span>
         <span>${esc(COMMANDS[task.agent] ?? task.agent)}</span>
+        ${depTag}
       </div>
       <div class="card-foot">
         <span>${timeAgo(task.updated_at)}</span>
         <span>${esc(loopLabel)}</span>
+        ${tokLabel ? `<span>${esc(tokLabel)} tok</span>` : ""}
         <span class="spacer"></span>
         ${isRunning ? '<span class="live">running</span>' : ""}
       </div>
@@ -424,23 +448,31 @@ function renderDrawer() {
 
   const project = ui.detail?.project ?? ui.data?.projects?.find((item) => item.id === task.project_id);
   const running = ui.detail ? Boolean(ui.detail.running) : Boolean((ui.data?.running ?? []).includes(task.id));
-  const canRun = ["specced", "working", "fixing", "review", "verify"].includes(task.state);
+  const isResearch = task.kind === "research";
+  const canRun = ["specced", "queued", "working", "fixing", "review", "verify"].includes(task.state);
+  const canQueue = ["specced", "blocked"].includes(task.state);
   const loops = Number(task.review_loops ?? 0);
   const runtime = ui.detail?.runtime;
-  const runtimeLabel = runtime
-    ? `${COMMANDS[runtime.implementer] ?? runtime.implementer} → ${COMMANDS[runtime.reviewer] ?? runtime.reviewer}`
-    : COMMANDS[task.agent] ?? task.agent;
+  const runtimeLabel = isResearch
+    ? `Research: ${(runtime?.researchAgents ?? [task.agent]).map((a) => COMMANDS[a] ?? a).join(" + ")}`
+    : runtime
+      ? `${COMMANDS[runtime.implementer] ?? runtime.implementer} → ${COMMANDS[runtime.reviewer] ?? runtime.reviewer}`
+      : COMMANDS[task.agent] ?? task.agent;
   const modelNote =
     runtime && (runtime.implModel !== "default" || runtime.reviewModel !== "default")
-      ? ` (${runtime.implModel} / ${runtime.reviewModel})`
+      ? ` (${runtime.implModel}${isResearch ? "" : ` / ${runtime.reviewModel}`})`
       : "";
   const rateLimitEvent = [...(ui.detail?.events ?? [])]
     .reverse()
-    .find((event) => event.type === "agent.rate_limit");
+    .find((event) => event.type === "agent.rate_limit" || event.type === "run.paused_quota");
+  const tabs = isResearch ? ["spec", "brief", "events"] : ["spec", "review", "diff", "tests", "events"];
+  if (!tabs.includes(ui.tab)) ui.tab = isResearch && ui.detail?.brief ? "brief" : "spec";
 
   const actions = running
     ? '<button class="btn danger" data-action="stop">■ Stop</button>'
-    : `<button class="btn primary" data-action="run" ${canRun ? "" : "disabled"}>▶ Run</button>`;
+    : `<button class="btn primary" data-action="run" ${canRun ? "" : "disabled"}>▶ Run</button>${
+        canQueue ? '<button class="btn small" data-action="queue">Queue</button>' : ""
+      }`;
 
   root.innerHTML = `
     <div class="scrim" data-close-drawer></div>
@@ -451,10 +483,13 @@ function renderDrawer() {
           <h2>${esc(task.title)}</h2>
           <div class="drawer-sub">
             <span class="state-pill ${esc(task.state)}">${esc(STATE_LABEL[task.state] ?? task.state)}</span>
+            ${isResearch ? '<span class="mini-tag research">research</span>' : ""}
+            <span class="mini-tag tier-${esc(task.tier || "med")}">tier: ${esc(task.tier || "med")}</span>
             <span>${esc(project?.name ?? projectName(task.project_id))}</span>
             <span>·</span>
             <span>${esc(runtimeLabel)}${esc(modelNote)}</span>
             ${runtime?.agyYolo && runtime.implementer === "agy" ? '<span class="state-pill warn-pill">YOLO</span>' : ""}
+            ${task.depends_on ? `<span class="mini-tag dep">after ${esc(task.depends_on)}</span>` : ""}
             ${loops ? `<span>· loop ${loops}/2</span>` : ""}
             ${task.branch ? `<span>· <span class="mono">${esc(task.branch)}</span></span>` : ""}
           </div>
@@ -464,7 +499,7 @@ function renderDrawer() {
 
       <div class="drawer-bar">
         ${actions}
-        ${task.worktree ? `<button class="btn small" data-action="merge" ${running ? "disabled" : ""}>Merge</button>` : ""}
+        ${!isResearch && task.worktree ? `<button class="btn small" data-action="merge" ${running ? "disabled" : ""}>Merge</button>` : ""}
         <button class="btn small" data-action="open-worktree">Open folder</button>
         <button class="btn small" data-action="open-spec">Spec file</button>
         <button class="btn small" data-action="mark-done" ${running ? "disabled" : ""}>Mark done</button>
@@ -482,10 +517,10 @@ function renderDrawer() {
       </div>
 
       ${task.last_error ? `<div class="banner">${esc(task.last_error)}</div>` : ""}
-      ${rateLimitEvent ? `<div class="banner warn">Rate limit notice: ${esc(rateLimitEvent.text)}</div>` : ""}
+      ${rateLimitEvent ? `<div class="banner warn">Quota notice: ${esc(rateLimitEvent.text)}</div>` : ""}
 
       <nav class="tabs" aria-label="Task views">
-        ${["spec", "review", "diff", "tests", "events"]
+        ${tabs
           .map(
             (tab) =>
               `<button class="tab ${ui.tab === tab ? "active" : ""}" data-tab="${tab}">${
@@ -688,6 +723,24 @@ function renderDrawerBody() {
     return;
   }
 
+  if (ui.tab === "brief") {
+    if (!detail.brief) {
+      body.innerHTML =
+        '<div class="empty-panel">No research brief yet. Run the research task to generate a condensed brief in docs/research/.</div>';
+      return;
+    }
+    body.innerHTML = `
+      <div class="code-head">
+        <span class="mono">brief.md</span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" data-action="toggle-brief-raw">${
+          ui.briefRaw ? "Rendered" : "Raw"
+        }</button>
+      </div>
+      ${ui.briefRaw ? `<pre class="code">${esc(detail.brief)}</pre>` : renderMarkdown(detail.brief)}`;
+    return;
+  }
+
   if (ui.tab === "review") {
     if (!detail.review) {
       body.innerHTML =
@@ -734,6 +787,13 @@ function renderDrawerBody() {
 
   const events = [...(detail.events ?? [])].reverse();
   const runs = detail.runs ?? [];
+  const usage = detail.usage;
+  const usageSummary =
+    usage && (usage.totalTokens > 0 || (usage.costUsd ?? 0) > 0)
+      ? ` · ${formatTokens(usage.totalTokens)} tok (${formatTokens(usage.inputTokens) || 0} in / ${formatTokens(usage.outputTokens) || 0} out${
+          usage.cacheReadTokens ? ` / ${formatTokens(usage.cacheReadTokens)} cache` : ""
+        })${usage.costUsd ? ` · $${Number(usage.costUsd).toFixed(4)}` : ""}`
+      : "";
   body.innerHTML = `
     ${
       events.length
@@ -743,17 +803,28 @@ function renderDrawerBody() {
     ${
       runs.length
         ? `<div class="run-summary">
-            <h4>Runs</h4>
+            <h4>Runs${esc(usageSummary)}</h4>
             ${runs
-              .map(
-                (run) => `<div class="run-row">
-                  <span>${esc(run.step)} · ${esc(run.agent)}</span>
+              .map((run) => {
+                const tok =
+                  Number(run.input_tokens ?? 0) +
+                  Number(run.output_tokens ?? 0) +
+                  Number(run.thinking_tokens ?? 0);
+                const meta = [
+                  run.model || "",
+                  tok > 0 ? `${formatTokens(tok)} tok` : "",
+                  run.cost_usd ? `$${Number(run.cost_usd).toFixed(4)}` : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ");
+                return `<div class="run-row">
+                  <span>${esc(run.step)} · ${esc(run.agent)}${meta ? ` <span class="mono">(${esc(meta)})</span>` : ""}</span>
                   <span>${esc(String(run.started_at ?? "").slice(11, 19))}</span>
                   <span class="${run.status === "ok" ? "good" : run.status === "running" ? "" : "bad"}">${esc(
                     run.status,
                   )}</span>
-                </div>`,
-              )
+                </div>`;
+              })
               .join("")}
           </div>`
         : ""
@@ -865,6 +936,12 @@ async function handleAction(action, element) {
       return;
     }
 
+    if (action === "toggle-brief-raw") {
+      ui.briefRaw = !ui.briefRaw;
+      renderDrawerBody();
+      return;
+    }
+
     if (action === "toggle-diff-raw") {
       ui.diffRaw = !ui.diffRaw;
       renderDrawerBody();
@@ -878,7 +955,7 @@ async function handleAction(action, element) {
       return;
     }
 
-    if (!id && ["run", "stop", "merge", "delete-task", "mark-done", "mark-blocked", "save-spec", "open-worktree", "open-spec"].includes(action)) {
+    if (!id && ["run", "queue", "stop", "merge", "delete-task", "mark-done", "mark-blocked", "save-spec", "open-worktree", "open-spec"].includes(action)) {
       return;
     }
 
@@ -889,6 +966,14 @@ async function handleAction(action, element) {
       toast(`${id}: pipeline started`, "ok");
       scheduleStateRefresh(300);
       scheduleDetailRefresh(350);
+      return;
+    }
+
+    if (action === "queue") {
+      await api(`/api/tasks/${encodeURIComponent(id)}/queue`, { method: "POST" });
+      toast(`${id}: queued`, "ok");
+      await refreshState();
+      await refreshDetail(true);
       return;
     }
 
@@ -1025,26 +1110,35 @@ function openTaskModal() {
         <header class="modal-head">
           <div>
             <h2 id="taskModalTitle">New task</h2>
-            <p>A task, a spec file, and a branch name. Not a chat message.</p>
+            <p>A task, a spec file, and a branch name — or a read-only research brief.</p>
           </div>
           <button class="drawer-close" data-close-modal aria-label="Close">×</button>
         </header>
         <form id="taskForm">
+          <div class="field-row">
+            <label class="field">
+              <span>Project</span>
+              <select name="projectId" required>
+                ${projects
+                  .map(
+                    (project) =>
+                      `<option value="${esc(project.id)}" ${project.id === selected ? "selected" : ""}>${esc(
+                        project.name,
+                      )}</option>`,
+                  )
+                  .join("")}
+              </select>
+            </label>
+            <label class="field">
+              <span>Type</span>
+              <select name="kind">
+                <option value="code">Code task (worktree + review)</option>
+                <option value="research">Research (read-only brief)</option>
+              </select>
+            </label>
+          </div>
           <label class="field">
-            <span>Project</span>
-            <select name="projectId" required>
-              ${projects
-                .map(
-                  (project) =>
-                    `<option value="${esc(project.id)}" ${project.id === selected ? "selected" : ""}>${esc(
-                      project.name,
-                    )}</option>`,
-                )
-                .join("")}
-            </select>
-          </label>
-          <label class="field">
-            <span>Title</span>
+            <span>Title / research question</span>
             <input name="title" required autofocus placeholder="Retry failed uploads once" />
           </label>
           <label class="field">
@@ -1052,17 +1146,38 @@ function openTaskModal() {
             <textarea name="description" rows="4" placeholder="What hurts, for whom, why now. Leave empty for a title-only inbox item."></textarea>
           </label>
           <label class="field">
-            <span>Acceptance criteria</span>
+            <span>Acceptance criteria / focus</span>
             <textarea name="acceptance" rows="3" placeholder="- [ ] uploads retry on 5xx&#10;- [ ] a test covers the retry"></textarea>
           </label>
-          <label class="field">
-            <span>Implementer</span>
-            <select name="agent">
-              <option value="claude">Claude Code</option>
-              <option value="agy">Google Antigravity</option>
-            </select>
-          </label>
-          <p class="hint">Title only starts in Inbox. A description or acceptance criteria starts in Ready. The reviewer is the other CLI.</p>
+          <div class="field-row">
+            <label class="field">
+              <span>Implementer</span>
+              <select name="agent">
+                <option value="claude">Claude Code</option>
+                <option value="agy">Google Antigravity</option>
+                <option value="codex">OpenAI Codex</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Model tier</span>
+              <select name="tier">
+                <option value="low">Low (plan saver — Sonnet / small)</option>
+                <option value="med" selected>Medium (default)</option>
+                <option value="high">High (flagship)</option>
+              </select>
+            </label>
+          </div>
+          <div class="field-row">
+            <label class="field">
+              <span>Depends on (optional)</span>
+              <input name="dependsOn" placeholder="T-0001, T-0002" />
+            </label>
+            <label class="field">
+              <span>Research agents (research only)</span>
+              <input name="researchAgents" placeholder="claude,agy" />
+            </label>
+          </div>
+          <p class="hint">Low tier routes simple implementation work to smaller models while keeping reviewers on high tier. Research runs read-only with no edits or worktrees.</p>
           <div class="modal-actions">
             <button type="button" class="btn" data-close-modal>Cancel</button>
             <button type="submit" class="btn primary">Create task</button>
@@ -1084,6 +1199,7 @@ function reviewerOptionsHtml(selected = "") {
     ["same", "Same CLI (fresh plan session)"],
     ["claude", "Always Claude Code"],
     ["agy", "Always Google Antigravity"],
+    ["codex", "Always OpenAI Codex"],
   ];
   return opts
     .map(
@@ -1131,18 +1247,22 @@ function openProjectModal() {
             <span>Worktree setup command (optional)</span>
             <input name="setupCommand" placeholder="git submodule update --init" />
           </label>
+          <label class="field">
+            <span>Diff ignore patterns (optional, comma-separated)</span>
+            <input name="diffIgnore" placeholder="package-lock.json, *.lock, *.min.js (blank = defaults)" />
+          </label>
           <div class="field-row">
             <label class="field">
               <span>Implementer model (optional)</span>
-              <input name="implModel" list="orcModels" placeholder="CLI / env default" />
+              <input name="implModel" list="orcModels" placeholder="CLI / env / tier default" />
             </label>
             <label class="field">
               <span>Reviewer model (optional)</span>
-              <input name="reviewModel" list="orcModels" placeholder="CLI / env default" />
+              <input name="reviewModel" list="orcModels" placeholder="CLI / env / tier default" />
             </label>
           </div>
           ${modelDatalistHtml()}
-          <p class="hint">ORC writes AGENTS.md, docs/index.md, docs/specs/, docs/decisions/, and a .gitignore entry for .worktrees/. Existing files are left alone.</p>
+          <p class="hint">ORC writes AGENTS.md, docs/index.md, docs/specs/, docs/research/, docs/decisions/, and a .gitignore entry for .worktrees/. Existing files are left alone.</p>
           <div class="modal-actions">
             <button type="button" class="btn" data-close-modal>Cancel</button>
             <button type="submit" class="btn primary">Register project</button>
@@ -1154,6 +1274,9 @@ function openProjectModal() {
 }
 
 function openProjectSettingsModal(project) {
+  const diffIgnoreStr = Array.isArray(project.diffIgnore)
+    ? project.diffIgnore.join(", ")
+    : String(project.diffIgnore || "");
   $("#modalRoot").innerHTML = `
     <div class="modal-backdrop">
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="projectSettingsTitle">
@@ -1184,21 +1307,25 @@ function openProjectSettingsModal(project) {
             <input name="setupCommand" value="${esc(project.setupCommand || "")}" placeholder="git submodule update --init" />
           </label>
           <label class="field">
+            <span>Diff ignore patterns (blank = lockfiles/minified defaults, "none" to disable)</span>
+            <input name="diffIgnore" value="${esc(diffIgnoreStr)}" placeholder="package-lock.json, *.lock, *.min.js" />
+          </label>
+          <label class="field">
             <span>Reviewer policy</span>
             <select name="reviewer">${reviewerOptionsHtml(project.reviewer || "")}</select>
           </label>
           <div class="field-row">
             <label class="field">
               <span>Implementer model override</span>
-              <input name="implModel" list="orcModels" value="${esc(project.implModel || "")}" placeholder="CLI / env default" />
+              <input name="implModel" list="orcModels" value="${esc(project.implModel || "")}" placeholder="CLI / env / tier default" />
             </label>
             <label class="field">
               <span>Reviewer model override</span>
-              <input name="reviewModel" list="orcModels" value="${esc(project.reviewModel || "")}" placeholder="CLI / env default" />
+              <input name="reviewModel" list="orcModels" value="${esc(project.reviewModel || "")}" placeholder="CLI / env / tier default" />
             </label>
           </div>
           ${modelDatalistHtml()}
-          <p class="hint">Changes take effect on the next task run without restarting ORC. Leave model overrides blank to use ORC_* environment variables or CLI defaults.</p>
+          <p class="hint">Changes take effect on the next task run without restarting ORC. Leave model overrides blank to use tier routing, ORC_* env vars, or CLI defaults.</p>
           <div class="modal-actions">
             <button type="button" class="btn danger" data-action="remove-project" data-project-id="${esc(project.id)}">Unregister</button>
             <span class="spacer"></span>
@@ -1213,9 +1340,10 @@ function openProjectSettingsModal(project) {
 function openDoctorModal() {
   const health = ui.data?.health ?? {};
   const rows = [
-    ["Git", health.git, "https://git-scm.com/"],
-    ["Claude Code (claude)", health.claude, "irm https://claude.ai/install.ps1 | iex"],
-    ["Google Antigravity (agy)", health.agy, "irm https://antigravity.google/cli/install.ps1 | iex"],
+    ["Git", health.git, "https://git-scm.com/", false],
+    ["Claude Code (claude)", health.claude, "irm https://claude.ai/install.ps1 | iex", false],
+    ["Google Antigravity (agy)", health.agy, "irm https://antigravity.google/cli/install.ps1 | iex", false],
+    ["OpenAI Codex (codex)", health.codex, "npm install -g @openai/codex (optional)", true],
   ];
 
   $("#modalRoot").innerHTML = `
@@ -1231,10 +1359,12 @@ function openDoctorModal() {
         <div class="modal-body">
           <div class="doctor-list">
             ${rows
-              .map(([label, entry, installHint]) => {
+              .map(([label, entry, installHint, optional]) => {
                 const ok = Boolean(entry?.available);
+                const pillClass = ok ? "done" : optional ? "" : "blocked";
+                const pillText = ok ? "OK" : optional ? "OPTIONAL" : "MISSING";
                 return `<div class="doctor-row">
-                  <span class="state-pill ${ok ? "done" : "blocked"}">${ok ? "OK" : "MISSING"}</span>
+                  <span class="state-pill ${pillClass}">${pillText}</span>
                   <div>
                     <strong>${esc(label)}</strong>
                     <div class="mono">${esc(ok ? entry.path : installHint)}</div>
@@ -1243,7 +1373,7 @@ function openDoctorModal() {
               })
               .join("")}
           </div>
-          <p class="hint">After installing a CLI, sign in interactively once (<code>claude</code> / <code>agy</code>), install the global launcher (<code>node scripts/install-skill.mjs</code>), then restart <code>orc serve</code>.</p>
+          <p class="hint">After installing a CLI, sign in interactively once (<code>claude</code> / <code>agy</code> / <code>codex</code>), install the global launcher (<code>node scripts/install-skill.mjs</code>), then restart <code>orc serve</code>.</p>
           <div class="modal-actions">
             <button type="button" class="btn primary" data-close-modal>Close</button>
           </div>
@@ -1265,6 +1395,10 @@ async function submitTaskForm(form) {
         description: data.description,
         acceptance: data.acceptance,
         agent: data.agent,
+        kind: data.kind || "code",
+        tier: data.tier || "med",
+        dependsOn: data.dependsOn || null,
+        researchAgents: data.researchAgents || null,
       }),
     });
     closeModal();
@@ -1291,6 +1425,7 @@ async function submitProjectForm(form) {
         baseBranch: data.baseBranch,
         testCommand: data.testCommand,
         setupCommand: data.setupCommand,
+        diffIgnore: data.diffIgnore,
         reviewer: data.reviewer,
         implModel: data.implModel,
         reviewModel: data.reviewModel,
@@ -1320,6 +1455,7 @@ async function submitProjectSettingsForm(form) {
         baseBranch: data.baseBranch,
         testCommand: data.testCommand,
         setupCommand: data.setupCommand,
+        diffIgnore: data.diffIgnore,
         reviewer: data.reviewer,
         implModel: data.implModel,
         reviewModel: data.reviewModel,
@@ -1359,7 +1495,11 @@ function connectEvents() {
 
     if (event.type === "run.failed") toast(event.text || "Run failed", "error");
     if (event.type === "run.stopped") toast("Run stopped", "");
-    if (event.type === "agent.rate_limit") toast(`Rate limit: ${event.text}`, "error");
+    if (event.type === "agent.rate_limit" || event.type === "run.paused_quota") {
+      toast(`Quota: ${event.text}`, "error");
+    }
+    if (event.type === "queue.halted") toast(event.text || "Queue halted", "error");
+    if (event.type === "research.completed") toast(event.text || "Research complete", "ok");
 
     if (ui.selectedTaskId && event.taskId === ui.selectedTaskId && ui.detail) {
       const exists = ui.detail.events.some((item) => item.id === event.id);
@@ -1384,9 +1524,13 @@ function connectEvents() {
         "verify.failed",
         "diff.captured",
         "task.created",
+        "task.queued",
         "task.merged",
+        "queue.halted",
+        "research.completed",
         "merge.refused",
         "run.refused",
+        "run.paused_quota",
       ].includes(event.type)
     ) {
       scheduleStateRefresh(350);

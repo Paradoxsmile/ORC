@@ -17,13 +17,18 @@ import {
   getState,
   getTask,
   getTaskDetail,
+  normalizeAgent,
   saveSpec,
   setState,
   syncAll,
 } from "./board.js";
 import {
   checkConcurrency,
+  checkDependencies,
+  checkQuotaGuardrail,
+  getQuotaSnapshot,
   mergeTask,
+  queueTask,
   recoverWorktrees,
   removeTask,
   runningTaskIds,
@@ -172,7 +177,12 @@ async function route(req, res, clients) {
   }
 
   if (pathname === "/api/state" && method === "GET") {
-    sendJson(res, { ...getState(), running: runningTaskIds(), now: nowIso() });
+    sendJson(res, {
+      ...getState(),
+      running: runningTaskIds(),
+      quota: getQuotaSnapshot(),
+      now: nowIso(),
+    });
     return;
   }
 
@@ -183,7 +193,13 @@ async function route(req, res, clients) {
       title: body.title,
       description: body.description ?? "",
       acceptance: body.acceptance ?? "",
-      agent: body.agent === "agy" ? "agy" : "claude",
+      agent: normalizeAgent(body.agent),
+      kind: body.kind ?? "code",
+      tier: body.tier ?? "med",
+      dependsOn: body.dependsOn ?? null,
+      implModel: body.implModel ?? "",
+      reviewModel: body.reviewModel ?? "",
+      researchAgents: body.researchAgents ?? null,
     });
     sendJson(res, { task }, 201);
     return;
@@ -200,6 +216,7 @@ async function route(req, res, clients) {
       reviewer: body.reviewer || "",
       implModel: body.implModel || "",
       reviewModel: body.reviewModel || "",
+      diffIgnore: body.diffIgnore ?? "",
     });
     const init = initProject(project);
     syncAll();
@@ -263,9 +280,21 @@ async function route(req, res, clients) {
       }
       if (task.state === "done") throw httpError(`${task.id} is already done`, 400);
 
+      const deps = checkDependencies(task);
+      if (!deps.ok) {
+        const reasons = [];
+        if (deps.blocked.length) reasons.push(`blocked: ${deps.blocked.join(", ")}`);
+        if (deps.pending.length) reasons.push(`waiting on: ${deps.pending.join(", ")}`);
+        if (deps.missing.length) reasons.push(`missing: ${deps.missing.join(", ")}`);
+        throw httpError(`${task.id} has unmet dependencies (${reasons.join("; ")}). Queue it instead.`, 409);
+      }
+
       const project = resolveProject(task.project_id);
       if (!project) throw httpError(`Unknown project: ${task.project_id}`, 400);
       checkConcurrency(task, project);
+
+      const quota = checkQuotaGuardrail(task.agent, task.id);
+      if (quota.paused) throw httpError(quota.message, 429);
 
       runTask(task.id, { actor: "you" }).catch((error) => {
         addEvent({
@@ -277,6 +306,12 @@ async function route(req, res, clients) {
         bus.emit("refresh");
       });
       sendJson(res, { ok: true, taskId: task.id, running: true }, 202);
+      return;
+    }
+
+    if (action === "queue" && method === "POST") {
+      const task = queueTask(taskId, { actor: "you" });
+      sendJson(res, { ok: true, task }, 200);
       return;
     }
 
@@ -335,6 +370,9 @@ async function route(req, res, clients) {
       } else if (body.target === "review") {
         if (!detail.artifacts.review) throw httpError("No review artifact yet", 404);
         opened = revealFile(detail.artifacts.review);
+      } else if (body.target === "brief") {
+        if (!detail.artifacts.brief) throw httpError("No research brief yet", 404);
+        opened = revealFile(detail.artifacts.brief);
       } else if (body.target === "project") {
         opened = openTarget(detail.project.path);
       } else {

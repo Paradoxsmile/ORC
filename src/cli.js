@@ -8,6 +8,7 @@ import {
   failTask,
   getState,
   getTask,
+  normalizeAgent,
   setState,
   STATES,
   syncAll,
@@ -23,7 +24,9 @@ import {
   resolveProject,
 } from "./config.js";
 import {
+  getQuotaSnapshot,
   mergeTask,
+  queueTask,
   recoverWorktrees,
   removeTask,
   runningTaskIds,
@@ -39,6 +42,12 @@ const VALUE_FLAGS = new Set([
   "description",
   "accept",
   "agent",
+  "agents",
+  "tier",
+  "kind",
+  "type",
+  "depends-on",
+  "diff-ignore",
   "name",
   "path",
   "branch",
@@ -98,7 +107,9 @@ export async function main(argv) {
       const projectRef = positional[1];
       const title = positional.slice(2).join(" ").trim();
       if (!projectRef || !title) {
-        throw new Error('Usage: node bin/orc.js add <project> "<title>" --desc "..." --accept "- ..."');
+        throw new Error(
+          'Usage: node bin/orc.js add <project> "<title>" --desc "..." --accept "- ..." [--agent claude|agy|codex] [--tier low|med|high] [--depends-on T-0001]',
+        );
       }
       const project = resolveProject(projectRef);
       if (!project) {
@@ -111,18 +122,78 @@ export async function main(argv) {
         title,
         description: String(flags.desc ?? flags.description ?? ""),
         acceptance: String(flags.accept ?? ""),
-        agent: flags.agent === "agy" ? "agy" : "claude",
+        agent: normalizeAgent(flags.agent),
+        kind: String(flags.kind ?? flags.type ?? "code"),
+        tier: String(flags.tier ?? "med"),
+        dependsOn: flags["depends-on"] ?? null,
+        implModel: String(flags["impl-model"] ?? ""),
+        reviewModel: String(flags["review-model"] ?? ""),
+        researchAgents: flags.agents ?? null,
       });
-      console.log(`Created ${task.id} · ${task.state}`);
+      console.log(`Created ${task.id} · ${task.state} (${task.kind}/${task.tier})`);
       console.log(`  project : ${project.name}`);
       console.log(`  agent   : ${agentLabel(task.agent)}`);
       console.log(`  spec    : ${task.spec_path}`);
-      console.log(`  branch  : ${task.branch}`);
+      if (task.branch) console.log(`  branch  : ${task.branch}`);
+      if (task.depends_on) console.log(`  depends : ${task.depends_on}`);
       if (task.state === "inbox") {
         console.log(`  next    : write the spec, then run ${task.id}`);
+      } else if (task.depends_on) {
+        console.log(`  next    : node bin/orc.js queue ${task.id}`);
       } else {
         console.log(`  next    : node bin/orc.js run ${task.id}`);
       }
+      return;
+    }
+
+    case "research": {
+      const projectRef = positional[1];
+      const question = positional.slice(2).join(" ").trim();
+      if (!projectRef || !question) {
+        throw new Error(
+          'Usage: node bin/orc.js research <project> "<question>" [--agents claude,agy] [--tier low|med|high] [--run]',
+        );
+      }
+      const project = resolveProject(projectRef);
+      if (!project) {
+        throw new Error(
+          `Unknown project "${projectRef}". Register it: node bin/orc.js project add <path> --name "${projectRef}"`,
+        );
+      }
+      const primaryAgent = normalizeAgent(
+        flags.agent || String(flags.agents ?? "claude").split(",")[0],
+      );
+      const task = createTask({
+        projectId: project.id,
+        title: question,
+        description: String(flags.desc ?? flags.description ?? question),
+        acceptance: String(flags.accept ?? ""),
+        agent: primaryAgent,
+        kind: "research",
+        tier: String(flags.tier ?? "med"),
+        researchAgents: flags.agents ?? primaryAgent,
+      });
+      console.log(`Created research ${task.id} · ${task.state}`);
+      console.log(`  project : ${project.name}`);
+      console.log(`  agents  : ${(task.researchAgents || [task.agent]).join(", ")}`);
+      console.log(`  spec    : ${task.spec_path}`);
+      if (flags.run) {
+        console.log(`Running research ${task.id}…`);
+        const final = await runTask(task.id);
+        console.log(`${final.id} · ${final.state}`);
+        if (final.state === "blocked") process.exitCode = 1;
+      } else {
+        console.log(`  next    : node bin/orc.js run ${task.id}`);
+      }
+      return;
+    }
+
+    case "queue": {
+      const id = positional[1];
+      if (!id) throw new Error("Usage: node bin/orc.js queue <taskId>");
+      const task = queueTask(id, { actor: "you", autoDrain: !flags["no-drain"] });
+      console.log(`Queued ${task.id} · ${task.title}`);
+      if (task.depends_on) console.log(`  depends : ${task.depends_on}`);
       return;
     }
 
@@ -139,14 +210,15 @@ export async function main(argv) {
         console.log("No tasks. Add one: node bin/orc.js add <project> \"<title>\" --desc \"...\"");
         return;
       }
-      console.log(`${pad("ID", 8)}${pad("STATE", 10)}${pad("PROJECT", 18)}${pad("AGENT", 9)}${pad("UPDATED", 18)}TITLE`);
-      console.log("-".repeat(100));
+      console.log(`${pad("ID", 8)}${pad("STATE", 10)}${pad("TIER", 6)}${pad("PROJECT", 18)}${pad("AGENT", 9)}${pad("UPDATED", 18)}TITLE`);
+      console.log("-".repeat(106));
       for (const task of tasks) {
+        const kindTag = task.kind === "research" ? "[R] " : "";
         console.log(
-          `${pad(task.id, 8)}${pad(task.state, 10)}${pad(task.projectName, 18)}${pad(task.agent, 9)}${pad(
+          `${pad(task.id, 8)}${pad(task.state, 10)}${pad(task.tier || "med", 6)}${pad(task.projectName, 18)}${pad(task.agent, 9)}${pad(
             String(task.updated_at ?? "").slice(0, 16).replace("T", " "),
             18,
-          )}${truncate(task.title, 60)}`,
+          )}${truncate(`${kindTag}${task.title}`, 56)}`,
         );
       }
       console.log("");
@@ -258,11 +330,11 @@ export async function main(argv) {
       console.log("");
       console.log("ORC status");
       console.log("");
-      console.log(`${pad("PROJECT", 24)}${pad("ACTIVE", 8)}${pad("REVIEW", 8)}${pad("BLOCKED", 9)}${pad("DONE", 6)}TOTAL`);
-      console.log("-".repeat(62));
+      console.log(`${pad("PROJECT", 22)}${pad("ACTIVE", 8)}${pad("QUEUED", 8)}${pad("REVIEW", 8)}${pad("BLOCKED", 9)}${pad("DONE", 6)}TOTAL`);
+      console.log("-".repeat(68));
       for (const project of state.projects) {
         console.log(
-          `${pad(truncate(project.name, 22), 24)}${pad(project.active, 8)}${pad(project.counts.review, 8)}${pad(
+          `${pad(truncate(project.name, 20), 22)}${pad(project.active, 8)}${pad(project.counts.queued ?? 0, 8)}${pad(project.counts.review, 8)}${pad(
             project.blocked,
             9,
           )}${pad(project.done, 6)}${project.total}`,
@@ -284,6 +356,19 @@ export async function main(argv) {
         );
       }
 
+      const queued = state.tasks.filter((task) => task.state === "queued");
+      if (queued.length) {
+        console.log("");
+        console.log("Queued");
+        for (const task of queued) {
+          console.log(
+            `  ${task.id}  ${pad(task.projectName, 18)} ${truncate(task.title, 46)}${
+              task.depends_on ? `  [after ${task.depends_on}]` : ""
+            }`,
+          );
+        }
+      }
+
       const blocked = state.tasks.filter((task) => task.state === "blocked");
       console.log("");
       console.log("Needs a human");
@@ -291,6 +376,23 @@ export async function main(argv) {
       for (const task of blocked) {
         console.log(`  ${task.id}  ${task.projectName}  ${truncate(task.title, 50)}`);
         console.log(`        ${truncate(task.last_error ?? task.last_event ?? "", 100)}`);
+      }
+
+      const totalTokens = state.tasks.reduce((sum, task) => sum + Number(task.usage?.totalTokens ?? 0), 0);
+      const totalCost = state.tasks.reduce((sum, task) => sum + Number(task.usage?.costUsd ?? 0), 0);
+      if (totalTokens > 0 || totalCost > 0) {
+        console.log("");
+        console.log(
+          `Usage: ${totalTokens.toLocaleString()} tokens${totalCost > 0 ? ` · $${totalCost.toFixed(4)} est.` : ""}`,
+        );
+      }
+      const quota = getQuotaSnapshot();
+      const quotaEntries = Object.values(quota);
+      if (quotaEntries.length) {
+        for (const entry of quotaEntries) {
+          const pct = Number.isFinite(entry.utilization) ? `${Math.round(entry.utilization * 100)}%` : "";
+          console.log(`Quota (${entry.agent}): ${[entry.status, entry.rateLimitType, pct].filter(Boolean).join(" · ")}`);
+        }
       }
       console.log("");
       console.log(`Board: ${path.join(ROOT, "STATUS.md")}`);
@@ -379,7 +481,7 @@ export async function main(argv) {
 
       if (sub === "add") {
         const target = positional[2] ?? flags.path;
-        if (!target) throw new Error("Usage: node bin/orc.js project add <path> [--name \"...\"] [--base main] [--test \"npm test\"] [--setup \"...\"]");
+        if (!target) throw new Error("Usage: node bin/orc.js project add <path> [--name \"...\"] [--base main] [--test \"npm test\"] [--setup \"...\"] [--diff-ignore \"...\"]");
         const project = addProject({
           name: flags.name,
           projectPath: target,
@@ -389,6 +491,7 @@ export async function main(argv) {
           reviewer: flags.reviewer || "",
           implModel: flags["impl-model"] || "",
           reviewModel: flags["review-model"] || "",
+          diffIgnore: flags["diff-ignore"] || "",
         });
         let init = null;
         if (!flags["no-init"]) init = initProject(project);
@@ -455,6 +558,13 @@ function doctor() {
     health.agy?.available
       ? health.agy.path
       : "not found — install Google Antigravity and sign in once",
+  );
+  line(
+    Boolean(health.codex?.available),
+    "codex",
+    health.codex?.available
+      ? health.codex.path
+      : "not found (optional) — install OpenAI Codex CLI (@openai/codex) if desired",
   );
 
   console.log("");
@@ -552,7 +662,7 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`
-ORC — local mission control for Claude Code and Google Antigravity
+ORC — local mission control for Claude Code, Google Antigravity, and Codex
 
   node bin/orc.js serve [--port 4317]      dashboard at http://127.0.0.1:4317
   node bin/orc.js doctor                   check CLIs, git, and projects
@@ -561,26 +671,31 @@ ORC — local mission control for Claude Code and Google Antigravity
   node bin/orc.js project remove <id>      unregister a project
   node bin/orc.js init <project|path>      write docs/AGENTS scaffolding only
   node bin/orc.js add <project> "<title>"  create a task + spec + branch name
-        [--desc "..."] [--accept "- ..."] [--agent claude|agy]
+        [--desc "..."] [--accept "- ..."] [--agent claude|agy|codex]
+        [--tier low|med|high] [--depends-on T-0001] [--type code|research]
+  node bin/orc.js research <project> "<q>" create read-only research task (no edits)
+        [--agents claude,agy] [--tier low|med|high] [--run]
   node bin/orc.js list [project]           list tasks
-  node bin/orc.js run <taskId>             drive implementation → review → verify
+  node bin/orc.js run <taskId>             drive implementation → verify → review
+  node bin/orc.js queue <taskId>           queue task behind active run / dependencies
   node bin/orc.js stop <taskId>            stop the active agent process
   node bin/orc.js merge <taskId>           rebase onto base, clean worktree, mark done
   node bin/orc.js delete <taskId> [--clean] remove task from board (--clean removes worktree)
   node bin/orc.js state <taskId> <state>   move a task manually
   node bin/orc.js done <taskId>            mark done
   node bin/orc.js block <taskId>           mark blocked (needs a human)
-  node bin/orc.js status                   regenerate + print the board
+  node bin/orc.js status                   regenerate + print the board + usage
   node bin/orc.js open [task|project]      open in Explorer (--spec, --project)
   node bin/orc.js install                  install global orc launcher + agent skill
 
 What "add" creates
   A task row (T-0001), a spec file under docs/specs/, and a branch name.
   Title only → inbox. With --desc or --accept → specced and runnable.
-  Running a task creates a git worktree at <project>/.worktrees/T-0001.
+  Running a code task creates a git worktree at <project>/.worktrees/T-0001.
+  Research tasks run read-only directly against the repo and write docs/research/.
 
 States
-  inbox → specced → working → review → verify → done
+  inbox → specced → queued → working → verify → review → done
   review/fixing loops (max 2) · blocked = needs a human
 
 Notes

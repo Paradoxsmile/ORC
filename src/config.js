@@ -10,6 +10,15 @@ export const LOG_DIR = path.join(DATA_DIR, "logs");
 export const TEMPLATES_DIR = path.join(ROOT, "templates");
 export const PUBLIC_DIR = path.join(ROOT, "public");
 
+export const DEFAULT_DIFF_IGNORE = [
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "*.lock",
+  "*.min.js",
+  "*.min.css",
+];
+
 const DEFAULT_CONFIG = { port: 4317, projects: [] };
 
 export function loadConfig() {
@@ -17,6 +26,7 @@ export function loadConfig() {
   if (!config || typeof config !== "object") return structuredClone(DEFAULT_CONFIG);
   config.port = Number(config.port) || 4317;
   config.projects = Array.isArray(config.projects) ? config.projects : [];
+  if (config.tiers && typeof config.tiers !== "object") delete config.tiers;
   return config;
 }
 
@@ -45,6 +55,7 @@ export function addProject({
   reviewer = "",
   implModel = "",
   reviewModel = "",
+  diffIgnore = "",
 }) {
   const config = loadConfig();
   const abs = path.resolve(String(projectPath ?? "").trim());
@@ -76,6 +87,7 @@ export function addProject({
     reviewer: normalizeReviewer(reviewer),
     implModel: String(implModel || "").trim(),
     reviewModel: String(reviewModel || "").trim(),
+    diffIgnore: normalizeDiffIgnore(diffIgnore),
   };
   config.projects.push(project);
   saveConfig(config);
@@ -111,14 +123,36 @@ export function updateProject(ref, patch = {}) {
   if (patch.reviewModel !== undefined) {
     project.reviewModel = String(patch.reviewModel).trim();
   }
+  if (patch.diffIgnore !== undefined) {
+    project.diffIgnore = normalizeDiffIgnore(patch.diffIgnore);
+  }
 
   saveConfig(config);
   return project;
 }
 
+export function normalizeDiffIgnore(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean);
+  }
+  const raw = String(value ?? "").trim();
+  if (!raw) return [];
+  return raw
+    .split(/[,\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+export function effectiveDiffIgnore(project = null) {
+  const configured = normalizeDiffIgnore(project?.diffIgnore);
+  if (!configured.length) return [...DEFAULT_DIFF_IGNORE];
+  if (configured.length === 1 && configured[0].toLowerCase() === "none") return [];
+  return configured;
+}
+
 function normalizeReviewer(value) {
   const clean = String(value ?? "").trim().toLowerCase();
-  return ["", "claude", "agy", "same", "auto"].includes(clean) ? clean : "";
+  return ["", "claude", "agy", "codex", "same", "auto"].includes(clean) ? clean : "";
 }
 
 export function removeProject(ref) {
@@ -137,7 +171,14 @@ export function initProject(project) {
   const created = [];
   const warnings = [];
 
-  const dirs = ["docs", "docs/specs", "docs/decisions", "docs/reviews", "docs/_templates"];
+  const dirs = [
+    "docs",
+    "docs/specs",
+    "docs/decisions",
+    "docs/reviews",
+    "docs/research",
+    "docs/_templates",
+  ];
   for (const dir of dirs) {
     const full = path.join(project.path, dir);
     if (!existsSync(full)) {

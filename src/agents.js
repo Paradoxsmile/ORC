@@ -11,13 +11,16 @@ export function detectAgents(force = false) {
   cache = {
     claude: findBinary("claude"),
     agy: findBinary("agy"),
+    codex: findBinary("codex"),
     git: findBinary("git"),
   };
   return cache;
 }
 
 export function agentLabel(agent) {
-  return agent === "agy" ? "Antigravity" : "Claude";
+  if (agent === "agy") return "Antigravity";
+  if (agent === "codex") return "Codex";
+  return "Claude";
 }
 
 function findBinary(name) {
@@ -155,6 +158,8 @@ export async function runAgent({
     raw: state.raw,
     logPath,
     error: state.lastError,
+    usage: state.usage,
+    rateLimit: state.rateLimit,
   };
 }
 
@@ -188,6 +193,14 @@ export function createStreamState(sessionId = null) {
     raw: [],
     lastError: null,
     steps: new Map(),
+    usage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      thinkingTokens: 0,
+      costUsd: null,
+    },
+    rateLimit: null,
   };
 }
 
@@ -208,6 +221,20 @@ export function buildArgs(agent, prompt, { sessionId, mode, model, effort, yolo 
     ];
     if (sessionId) args.push("--resume", sessionId);
     if (model) args.push("--model", String(model));
+    return args;
+  }
+
+  if (agent === "codex") {
+    const review = mode === "plan";
+    const args = sessionId
+      ? ["exec", "resume", sessionId, "--json"]
+      : ["exec", "--json", "--sandbox", review ? "read-only" : "workspace-write"];
+    if (!sessionId && !review) {
+      if (yolo) args.push("--dangerously-bypass-approvals-and-sandbox");
+      else args.push("--full-auto");
+    }
+    if (model) args.push("--model", String(model));
+    args.push(prompt);
     return args;
   }
 
@@ -278,9 +305,20 @@ export function consumeLine(agent, line, state, onEvent) {
     return;
   }
 
+  // OpenAI Codex CLI JSONL: { type: "thread.started" | "turn.started" | "item.completed" | "turn.completed" | "turn.failed" | "error", ... }
+  if (
+    agent === "codex" ||
+    (typeof event.type === "string" &&
+      (event.type.startsWith("thread.") || event.type.startsWith("turn.") || event.type.startsWith("item.")))
+  ) {
+    consumeCodexEvent(event, state, onEvent);
+    return;
+  }
+
   if (event.type === "system") return;
 
   if (event.type === "result") {
+    applyUsage(state, event.usage, event.total_cost_usd);
     const text =
       typeof event.result === "string"
         ? event.result
@@ -296,6 +334,7 @@ export function consumeLine(agent, line, state, onEvent) {
         text,
         data: {
           cost: event.total_cost_usd,
+          usage: event.usage ?? null,
           isError: event.is_error,
           status: event.subtype,
         },
@@ -337,7 +376,14 @@ export function consumeLine(agent, line, state, onEvent) {
 
   if (event.type === "rate_limit_event") {
     const info = event.rate_limit_info ?? {};
-    const pct = Number.isFinite(info.utilization) ? `${Math.round(info.utilization * 100)}%` : "";
+    const utilization = Number.isFinite(info.utilization) ? Number(info.utilization) : null;
+    state.rateLimit = {
+      status: info.status || "rate_limit",
+      rateLimitType: info.rateLimitType || null,
+      utilization,
+      resetsAt: info.resetsAt ?? null,
+    };
+    const pct = utilization !== null ? `${Math.round(utilization * 100)}%` : "";
     const parts = [info.status || "rate_limit", info.rateLimitType, pct].filter(Boolean);
     onEvent({ kind: "rate_limit", text: parts.join(" · "), data: info });
     return;
@@ -358,6 +404,69 @@ export function consumeLine(agent, line, state, onEvent) {
   } else {
     onEvent({ kind: "event", text: event.type ?? `${agent}.event` });
   }
+}
+
+function consumeCodexEvent(event, state, onEvent) {
+  const type = event.type;
+  if (type === "thread.started" || type === "turn.started" || type === "item.started") return;
+
+  if (type === "item.completed" || type === "item.updated") {
+    const item = event.item ?? {};
+    if (
+      (item.type === "agent_message" || item.type === "message") &&
+      typeof item.text === "string" &&
+      type === "item.completed"
+    ) {
+      const prefix = state.text && !state.text.endsWith("\n") ? "\n" : "";
+      state.text += `${prefix}${item.text}`;
+      onEvent({ kind: "text", text: item.text });
+      return;
+    }
+    if (type === "item.completed" && item.type === "command_execution") {
+      onEvent({ kind: "tool", text: `shell: ${truncate(item.command ?? "cmd", 120)}` });
+      if (item.aggregated_output) {
+        onEvent({ kind: "tool_result", text: stringify(item.aggregated_output) });
+      }
+      return;
+    }
+    if (type === "item.completed" && item.type === "file_change") {
+      const files = Array.isArray(item.changes)
+        ? item.changes.map((c) => c.path).filter(Boolean).join(", ")
+        : "file_change";
+      onEvent({ kind: "tool", text: `edit: ${truncate(files, 120)}` });
+      return;
+    }
+    if (type === "item.completed" && item.type === "mcp_tool_call") {
+      onEvent({ kind: "tool", text: item.tool ?? item.name ?? "mcp_tool" });
+      if (item.result) onEvent({ kind: "tool_result", text: stringify(item.result) });
+      return;
+    }
+    if (item.type === "error") {
+      state.lastError = String(item.message ?? item.text ?? "Codex item error");
+      onEvent({ kind: "stderr", text: state.lastError });
+    }
+    return;
+  }
+
+  if (type === "turn.completed") {
+    applyUsage(state, event.usage, event.cost_usd ?? null);
+    onEvent({
+      kind: "result",
+      text: state.text.trim(),
+      data: { usage: event.usage ?? null, status: "completed" },
+    });
+    return;
+  }
+
+  if (type === "turn.failed" || type === "error") {
+    state.lastError = String(
+      event.error?.message ?? event.message ?? event.error ?? "Codex run failed",
+    );
+    onEvent({ kind: "stderr", text: state.lastError });
+    return;
+  }
+
+  onEvent({ kind: "event", text: type ?? "codex.event" });
 }
 
 function consumeAntigravityEvent(event, state, onEvent) {
@@ -399,6 +508,7 @@ function consumeAntigravityEvent(event, state, onEvent) {
 
   if (event.event === "result") {
     const payload = event.result ?? {};
+    applyUsage(state, payload.usage, payload.cost_usd ?? null);
     const text = typeof payload.response === "string" ? payload.response : "";
     if (text) {
       // The result is authoritative; live deltas may be partial or repeated.
@@ -423,6 +533,25 @@ function consumeAntigravityEvent(event, state, onEvent) {
   }
 
   onEvent({ kind: "event", text: event.event });
+}
+
+function applyUsage(state, usage, costUsd = null) {
+  if (usage && typeof usage === "object") {
+    const input = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0);
+    const output = Number(usage.output_tokens ?? usage.completion_tokens ?? 0);
+    const cacheRead = Number(
+      usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? usage.cached_input_tokens ?? 0,
+    );
+    const thinking = Number(usage.thinking_tokens ?? usage.reasoning_tokens ?? 0);
+    if (Number.isFinite(input) && input > 0) state.usage.inputTokens = input;
+    if (Number.isFinite(output) && output > 0) state.usage.outputTokens = output;
+    if (Number.isFinite(cacheRead) && cacheRead > 0) state.usage.cacheReadTokens = cacheRead;
+    if (Number.isFinite(thinking) && thinking > 0) state.usage.thinkingTokens = thinking;
+  }
+  const cost = Number(costUsd);
+  if (costUsd !== null && costUsd !== undefined && Number.isFinite(cost)) {
+    state.usage.costUsd = cost;
+  }
 }
 
 function stringify(value) {

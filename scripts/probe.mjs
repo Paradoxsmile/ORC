@@ -15,6 +15,7 @@ import { ensureDir } from "../src/util.js";
 const EXPECTED_FLAGS = {
   claude: ["stream-json", "--permission-mode", "--allowedTools", "--resume", "--model"],
   agy: ["stream-json", "--mode", "--conversation", "--model", "--effort"],
+  codex: ["exec", "--json", "--sandbox", "--model"],
 };
 
 function parseProbeArgs(argv) {
@@ -24,7 +25,7 @@ function parseProbeArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
-      console.log("Usage: node scripts/probe.mjs [--agent claude|agy|all] [--out <dir>]");
+      console.log("Usage: node scripts/probe.mjs [--agent claude|agy|codex|all] [--out <dir>]");
       process.exit(0);
     } else if (arg === "--agent" && argv[i + 1]) {
       agent = argv[++i];
@@ -37,8 +38,8 @@ function parseProbeArgs(argv) {
     }
   }
 
-  if (!["all", "claude", "agy"].includes(agent)) {
-    throw new Error(`Invalid --agent "${agent}". Expected claude, agy, or all.`);
+  if (!["all", "claude", "agy", "codex"].includes(agent)) {
+    throw new Error(`Invalid --agent "${agent}". Expected claude, agy, codex, or all.`);
   }
   return { agent, outDir };
 }
@@ -143,7 +144,7 @@ async function probeOne(agent, binary, outDir) {
 async function main() {
   const { agent, outDir } = parseProbeArgs(process.argv.slice(2));
   const health = detectAgents(true);
-  const targets = agent === "all" ? ["claude", "agy"] : [agent];
+  const targets = agent === "all" ? ["claude", "agy", "codex"] : [agent];
 
   const results = [];
   for (const target of targets) {

@@ -28,13 +28,29 @@ Before breaking down work, read ONLY the relevant memory files in the target rep
 3. `docs/decisions/` — relevant ADRs (`ADR-*.md`) so subtasks never contradict past choices.
 4. `docs/board.md` — active, review, and blocked tasks.
 
+## Step 1.5 — Offload Heavy Codebase Exploration with Research Mode
+Before planning a complex feature in an unfamiliar area, don't burn your own interactive
+context window reading 30 files. Dispatch a read-only research task instead:
+```sh
+orc research <project> "<focused architecture or bug-hunting question>" \
+  --agents claude,agy --tier low --run
+```
+ORC runs the agent(s) in read-only `plan` mode (no worktree, no edits), saves full notes to
+`docs/research/`, and writes a condensed ~40-line executive brief to `.orc/<T-XXXX>/brief.md`.
+Read ONLY that `brief.md` before decomposing subtasks.
+
 ## Step 2 — Decompose into Focused Subtasks
 Split a large goal into **small, verifiable units** (ideally 1–5 files and 1 clear check per
 subtask). For each subtask, write:
 - A crisp `--desc` naming the exact module/files in scope, constraints, and what is OUT of scope.
 - Concrete `--accept` checklist items that a reviewer can verify from `git diff` + tests.
-- Choose `--agent agy` or `--agent claude` (the other CLI reviews automatically unless
-  `reviewer` is overridden on the project).
+- Choose `--agent agy`, `--agent claude`, or `--agent codex` (the other CLI reviews automatically
+  unless `reviewer` is overridden on the project).
+- **Optimize plan usage with `--tier`:** Use `--tier low` for mechanical/straightforward edits
+  (routes implementation to smaller models like Sonnet while keeping reviewers on `high` tier),
+  `--tier med` (default) for standard features, and `--tier high` only for tricky architecture.
+- **Chain dependent subtasks with `--depends-on`:** Queue downstream tasks so ORC auto-drains
+  them only after upstream tasks reach `done` (and halts if upstream blocks).
 
 Create each subtask with ORC (never dump huge chat logs into specs):
 ```sh
@@ -42,16 +58,17 @@ orc add <project> "<short title>" \
   --desc "Scope: <files/module>. Goal: <what changes>. Out of scope: <what not to touch>." \
   --accept "- [ ] <verifiable requirement 1>" \
   --accept "- [ ] <unit/sim test covers it>" \
-  --agent agy
+  --agent agy --tier low --depends-on T-0001
 ```
 
-## Step 3 — Dispatch, Monitor, and Merge
+## Step 3 — Dispatch, Queue, Monitor, and Merge
 - Check registered projects and health:
   `orc doctor`
-- Check the board:
-  `orc list <project>`
-- Run one subtask at a time per project (ORC enforces a per-project lock):
+- Check the board and token/quota usage:
+  `orc status` / `orc list <project>`
+- Run one subtask at a time per project, or queue follow-ups behind it:
   `orc run <T-XXXX>`
+  `orc queue <T-YYYY>`
 - After reviewing the diff/review in the ORC dashboard (`http://127.0.0.1:4317`), merge
   cleanly onto `baseBranch` (no auto-push):
   `orc merge <T-XXXX>`
